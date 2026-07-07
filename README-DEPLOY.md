@@ -134,6 +134,36 @@ HOW IT CONNECTS TO THE DESKTOP APP
     successful sync.
 
 ------------------------------------------------------------
+TROUBLESHOOTING: "Profile not found" after scanning a saved card
+------------------------------------------------------------
+This almost always means the card was never actually received by
+this server — usually because the browser blocked the desktop
+app's save/sync request before it left the computer (a CORS
+issue), not because anything is wrong with your domain or Render
+setup. This version of server.js already includes the fix
+(CORS headers + OPTIONS preflight handling) — if you deployed an
+earlier copy, just replace server.js with this one, push to
+GitHub, let Render redeploy, then:
+  1. Open the BMS desktop app → Settings → 🌐 Card Hosting →
+     confirm the Hosted Service URL exactly matches your live
+     URL (no trailing slash) and Save again.
+  2. Open/edit an existing card and click "Save Card" once —
+     watch for a toast message. If it says "publish failed" or
+     "could not reach the hosted service", it will tell you why.
+  3. Re-scan the QR code (or reopen the card's public link).
+
+Other things worth checking:
+  • Visiting https://<your-domain>/healthz should return JSON
+    with "ok": true.
+  • On Render's free tier, the service can "sleep" after periods
+    of no traffic and take a few seconds to wake up on the first
+    request — this is normal, just wait and try again.
+  • Make sure the Digital Business Card add-on is actually
+    approved for the account you're testing with (Licensing →
+    🪪), unless you're signed in as the Beat Digital owner, who
+    always has access.
+
+------------------------------------------------------------
 SUPPORT
 ------------------------------------------------------------
   Email:  admin@beatdigital.tech

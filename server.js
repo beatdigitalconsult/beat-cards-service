@@ -26,6 +26,21 @@ const app = express();
 app.use(express.json({ limit: '6mb' }));
 
 // ---------------------------------------------------------------
+// CORS — REQUIRED so the BMS desktop app (running from a file://
+// or localhost page) is allowed to call this API from the browser.
+// Without this, every save/sync request is silently blocked by the
+// browser before it ever reaches this server — which looks exactly
+// like "card not syncing" / "profile not found" when you scan it.
+// ---------------------------------------------------------------
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, x-license-key, x-admin-key');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+// ---------------------------------------------------------------
 // CONFIG
 // ---------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
