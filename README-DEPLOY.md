@@ -134,6 +134,19 @@ HOW IT CONNECTS TO THE DESKTOP APP
     successful sync.
 
 ------------------------------------------------------------
+TROUBLESHOOTING: Diagnostic shows "Failed to fetch" on
+"Load public profile page", or links come out as http:// not https://
+------------------------------------------------------------
+Fixed as of this version — server.js now includes
+app.set('trust proxy', 1), which tells Express to read Render's
+X-Forwarded-Proto header so it correctly reports "https" instead
+of defaulting to "http" (Render, like most hosts, terminates SSL
+in front of your app and forwards plain HTTP internally). If you
+deployed an earlier copy of server.js, just replace it with this
+one, push to GitHub, and let Render redeploy — no other changes
+needed.
+
+------------------------------------------------------------
 TROUBLESHOOTING: "Profile not found" after scanning a saved card
 ------------------------------------------------------------
 This almost always means the card was never actually received by

@@ -23,6 +23,14 @@ const path = require('path');
 const crypto = require('crypto');
 
 const app = express();
+
+// Render/Railway/Fly (and virtually every PaaS) terminate TLS at a proxy
+// in front of this app and forward the request as plain HTTP internally.
+// Without this line, req.protocol always reports "http" — even for a
+// visitor who came in over https — which produces broken
+// "http://card.beatdigital.tech/..." links instead of "https://...".
+// This tells Express to trust the proxy's X-Forwarded-Proto header.
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '6mb' }));
 
 // ---------------------------------------------------------------
