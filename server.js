@@ -21,6 +21,7 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { MongoClient } = require('mongodb');
 
 const app = express();
 
@@ -53,6 +54,7 @@ app.use((req, res, next) => {
 // ---------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 const ADMIN_KEY = process.env.ADMIN_KEY || 'CHANGE-ME-BEFORE-DEPLOY';
+const MONGODB_URI = process.env.MONGODB_URI || '';
 const OWNER_LICENSE_KEY = 'BD-OWNER'; // sentinel used by the Beat Digital Consult install itself
 const DB_PATH = path.join(__dirname, 'data', 'db.json');
 const BRAND = {
@@ -70,12 +72,68 @@ if (ADMIN_KEY === 'CHANGE-ME-BEFORE-DEPLOY') {
 }
 
 // ---------------------------------------------------------------
-// TINY JSON FILE DATABASE
-// (Fine for this workload — a few thousand cards. If you outgrow
-// it, swap loadDB/saveDB for a real database call; every other
-// route stays the same. See README-DEPLOY.md.)
+// PERSISTENCE
+//
+// IMPORTANT — READ THIS IF CARDS EVER "DISAPPEAR" OR SHOW
+// "PROFILE NOT FOUND" AFTER WORKING FINE EARLIER:
+//
+// Render's FREE web service tier has a completely ephemeral
+// filesystem — this is not a bug, it's documented Render
+// behaviour, and free services CANNOT attach persistent disks at
+// all (only paid services can). Render can also restart a free
+// service at any time, and always wipes its local files on every
+// restart, redeploy, or spin-down. If MONGODB_URI is not set, this
+// server falls back to the local JSON file below — which means
+// every card, every package approval, and every stat will be
+// silently lost the next time Render restarts this service. That
+// is almost certainly why cards work right after you resave them
+// and then vanish a short time later.
+//
+// THE FIX: set MONGODB_URI (a free MongoDB Atlas cluster works
+// great and never expires, unlike Render's free Postgres which
+// expires after 30 days) — see README-DEPLOY.md for the exact
+// steps. Once set, every card survives restarts, redeploys, and
+// spin-downs, permanently, for free. For a commercial product you
+// should also upgrade the Render web service itself to a paid
+// Starter plan (~$7/mo) so it never spins down at all — see
+// README-DEPLOY.md for why the free tier's 15-minute spin-down is
+// still worth eliminating even once your data is safe.
 // ---------------------------------------------------------------
-function loadDB() {
+let mongoCollection = null;
+
+async function initMongo() {
+  if (!MONGODB_URI) {
+    console.warn('\n⚠️  MONGODB_URI is not set — using local file storage only.');
+    console.warn('   On Render\'s free tier this means ALL CARDS WILL BE LOST on the');
+    console.warn('   next restart/redeploy/spin-down. See README-DEPLOY.md → "Making');
+    console.warn('   cards permanent" to fix this before going live with real clients.\n');
+    return;
+  }
+  try {
+    const client = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 8000 });
+    await client.connect();
+    const db = client.db('beat_management_system');
+    mongoCollection = db.collection('card_service_state');
+    console.log('✅ Connected to MongoDB — cards will now persist permanently across restarts.');
+  } catch (e) {
+    console.error('\n⚠️  Could not connect to MongoDB:', e.message);
+    console.error('   Falling back to local file storage (NOT persistent on Render free tier).');
+    console.error('   Double-check MONGODB_URI is correct and that your Atlas cluster allows');
+    console.error('   connections from anywhere (Network Access → 0.0.0.0/0) — see README-DEPLOY.md.\n');
+    mongoCollection = null;
+  }
+}
+
+async function loadDB() {
+  if (mongoCollection) {
+    try {
+      const doc = await mongoCollection.findOne({ _id: 'db' });
+      if (doc) return { cards: doc.cards || {}, packages: doc.packages || {} };
+      return { cards: {}, packages: {} };
+    } catch (e) {
+      console.error('MongoDB load error, falling back to local file for this boot:', e.message);
+    }
+  }
   try {
     if (!fs.existsSync(DB_PATH)) return { cards: {}, packages: {} };
     const raw = fs.readFileSync(DB_PATH, 'utf8');
@@ -86,16 +144,30 @@ function loadDB() {
     return { cards: {}, packages: {} };
   }
 }
-let DB = loadDB();
+
+let DB = { cards: {}, packages: {} }; // populated for real just before the server starts listening — see boot() below
 let saveTimer = null;
 function saveDB() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
+  saveTimer = setTimeout(async () => {
+    // Always write the local file too — harmless, and it's an instant
+    // fallback if Mongo has a hiccup on this particular boot.
     try {
       fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
       fs.writeFileSync(DB_PATH, JSON.stringify(DB, null, 2));
     } catch (e) {
-      console.error('DB save error:', e.message);
+      console.error('DB file save error:', e.message);
+    }
+    if (mongoCollection) {
+      try {
+        await mongoCollection.updateOne(
+          { _id: 'db' },
+          { $set: { cards: DB.cards, packages: DB.packages, updatedAt: new Date() } },
+          { upsert: true }
+        );
+      } catch (e) {
+        console.error('MongoDB save error (data is still safe in the local file for now):', e.message);
+      }
     }
   }, 150);
 }
@@ -166,7 +238,7 @@ app.get('/', (req, res) => {
   </div></body></html>`);
 });
 
-app.get('/healthz', (req, res) => res.json({ ok: true, product: BRAND.product, company: BRAND.company, cards: Object.keys(DB.cards).length }));
+app.get('/healthz', (req, res) => res.json({ ok: true, product: BRAND.product, company: BRAND.company, cards: Object.keys(DB.cards).length, storage: mongoCollection ? 'mongodb' : 'file-only (not persistent on Render free tier)' }));
 
 // ---------------------------------------------------------------
 // CARD SYNC  (called by the BMS desktop app whenever a card is saved)
@@ -381,8 +453,20 @@ app.get('/api/admin/overview', requireAdmin, (req, res) => {
 
 app.use((req, res) => res.status(404).send(notFoundPage()));
 
-app.listen(PORT, () => {
-  console.log(`\n🪪 ${BRAND.product} — Card Profile Service`);
-  console.log(`   by ${BRAND.company} — running on port ${PORT}`);
-  console.log(`   Health check: /healthz\n`);
-});
+// ---------------------------------------------------------------
+// BOOT — connect to MongoDB (if configured) and load existing data
+// BEFORE accepting any requests, so the very first request after a
+// restart already sees every previously-published card.
+// ---------------------------------------------------------------
+async function boot() {
+  await initMongo();
+  DB = await loadDB();
+  app.listen(PORT, () => {
+    console.log(`\n🪪 ${BRAND.product} — Card Profile Service`);
+    console.log(`   by ${BRAND.company} — running on port ${PORT}`);
+    console.log(`   Storage: ${mongoCollection ? 'MongoDB (persistent ✅)' : 'local file only (NOT persistent on Render free tier ⚠️)'}`);
+    console.log(`   Cards loaded: ${Object.keys(DB.cards).length}`);
+    console.log(`   Health check: /healthz\n`);
+  });
+}
+boot();

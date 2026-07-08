@@ -42,10 +42,12 @@ OPTION A — DEPLOY ON RENDER.COM (recommended, has a free tier)
      - Runtime: Node
      - Build Command:  npm install
      - Start Command:  npm start
-     - Instance Type: Free (fine to start; upgrade later for
-       always-on speed and a persistent disk — see note below)
+     - Instance Type: Free (fine to start — see "MAKING CARDS
+       PERMANENT" below before adding real clients, and
+       "ELIMINATING COLD-START DELAYS" for when you're ready to
+       upgrade to a paid, always-on instance)
 
-4. Under "Environment", add one variable:
+4. Under "Environment", add:
      ADMIN_KEY = <a long random string>
    Generate one on your own computer with Node installed:
      node -e "console.log(require('crypto').randomBytes(24).toString('hex'))"
@@ -60,25 +62,94 @@ OPTION A — DEPLOY ON RENDER.COM (recommended, has a free tier)
      https://beat-cards-service.onrender.com/healthz
    and confirm it replies with JSON showing "ok": true.
 
-   IMPORTANT — free tier persistence note: Render's free web
-   services use a temporary disk that is wiped on redeploy or
-   after long inactivity, so saved cards could be lost. For a
-   production launch, either (a) add a paid "Persistent Disk"
-   to this service in Render's dashboard and mount it at
-   /opt/render/project/src/data, or (b) swap the storage in
-   server.js for a real database — the README inside server.js
-   marks exactly where (loadDB/saveDB). Either is a quick change
-   once you're ready to go fully live; the free tier is great
-   for testing the whole flow first.
+   ⚠️ CRITICAL — DO THIS BEFORE ADDING REAL CLIENTS: by itself, this
+   deployment WILL lose every card. Read "MAKING CARDS PERMANENT"
+   right below and do it now — it takes 5 minutes and is free.
+
+------------------------------------------------------------
+MAKING CARDS PERMANENT — REQUIRED FOR REAL USE
+------------------------------------------------------------
+Render's FREE web services have a completely ephemeral filesystem,
+and — unlike paid services — free services CANNOT attach a
+persistent disk at all (this is a hard Render platform limit, not
+a workaround-able setting). Render can also restart a free service
+at any time. Every time that happens, every card saved only to the
+local file is gone. This is why cards can look "unstable" — working
+right after you resave one, then showing "profile not found" a
+short time later: the server restarted in between and lost its
+local file.
+
+THE FIX (free, ~5 minutes, and this version of server.js already
+supports it — you just need to create the database and set one
+environment variable):
+
+1. Go to https://www.mongodb.com/cloud/atlas/register and create a
+   free account (no credit card required).
+2. Create a free "M0" cluster (this tier is free forever, unlike
+   Render's free Postgres which expires after 30 days).
+3. Database Access → Add New Database User → set a username and
+   password (save these — you'll need them in step 5).
+4. Network Access → Add IP Address → "Allow Access From Anywhere"
+   (0.0.0.0/0). This is required because Render's servers don't
+   have a fixed IP address.
+5. Go to your cluster → Connect → "Drivers" → copy the connection
+   string. It looks like:
+     mongodb+srv://<username>:<password>@cluster0.xxxxx.mongodb.net/
+   Replace <username> and <password> with the values from step 3.
+6. In Render: your service → Environment → Add Environment
+   Variable:
+     MONGODB_URI = <the connection string from step 5>
+7. Render will redeploy automatically. Check your service logs —
+   you should see:
+     ✅ Connected to MongoDB — cards will now persist permanently across restarts.
+   If instead you see a connection error, double-check the
+   username/password and that Network Access allows 0.0.0.0/0.
+8. Confirm it worked: open https://<your-service-url>/healthz —
+   it should show "storage": "mongodb". Publish a test card, wait
+   a few minutes, and check the health check again; the card count
+   should stay the same (nothing will have been lost).
+
+Without MONGODB_URI set, the server still runs fine using a local
+file — useful for quick local testing — but you will see a loud
+warning in the logs every time it starts, and cards will not
+survive a restart. This is fine for testing, not for real clients.
+
+------------------------------------------------------------
+ELIMINATING COLD-START DELAYS (recommended for a paying product)
+------------------------------------------------------------
+Once MONGODB_URI is set, your cards are safe forever — but Render's
+free web service tier still spins down after 15 minutes with no
+traffic, and takes 30-60 seconds to wake back up on the next
+request. For a product you're charging clients for, either:
+
+  (a) Upgrade the Render web service itself to the paid "Starter"
+      instance type (from about $7/month) — this removes spin-down
+      entirely, so every scan is instant, 24/7, with no cold starts.
+      This is the option we'd recommend once you have real paying
+      clients relying on their cards working instantly.
+
+  (b) Stay on the free tier and set up a free external monitor
+      (e.g. https://uptimerobot.com or https://cron-job.org, both
+      free, no credit card) to ping
+        https://<your-service-url>/healthz
+      every 5-10 minutes. This keeps the free service awake almost
+      all the time, at no cost — though it can still occasionally
+      spin down and briefly delay a scan (and Render can restart a
+      free service at any time regardless, per their own docs).
+
+Either way, your card DATA is now safe once MONGODB_URI is set —
+these two options are purely about response speed/uptime, not data
+loss.
 
 ------------------------------------------------------------
 OPTION B — RAILWAY.APP or FLY.IO
 ------------------------------------------------------------
 Both work the same way: point them at this folder (or its own
 GitHub repo), Node runtime, "npm install" / "npm start", and set
-the ADMIN_KEY environment variable. Both offer persistent
-volumes for the data/ folder if you want the simple file-based
-storage to survive restarts long-term.
+the ADMIN_KEY and MONGODB_URI environment variables. Both of these
+platforms do offer persistent volumes on their free tiers too, if
+you'd rather use that than MongoDB Atlas — but MongoDB Atlas works
+identically across every host, so it's the option documented above.
 
 ------------------------------------------------------------
 CONNECTING YOUR OWN DOMAIN (beatdigital.tech)
@@ -148,15 +219,23 @@ needed.
 
 ------------------------------------------------------------
 TROUBLESHOOTING: "Profile not found" after scanning a saved card
+(especially if it worked right after saving, then stopped)
 ------------------------------------------------------------
-This almost always means the card was never actually received by
-this server — usually because the browser blocked the desktop
-app's save/sync request before it left the computer (a CORS
-issue), not because anything is wrong with your domain or Render
-setup. This version of server.js already includes the fix
-(CORS headers + OPTIONS preflight handling) — if you deployed an
-earlier copy, just replace server.js with this one, push to
-GitHub, let Render redeploy, then:
+If a card worked immediately after saving/resaving it, then broke
+a short time later — this is almost always the MONGODB_URI issue
+described in "MAKING CARDS PERMANENT" above: the server restarted
+(Render free tier can do this at any time) and lost every card
+that was only in its local file. Set MONGODB_URI and this stops
+happening entirely. Check https://<your-domain>/healthz — if
+"storage" shows "file-only", that confirms this is the cause.
+
+If a card NEVER worked, not even immediately after saving, the
+usual cause is the browser blocking the desktop app's save/sync
+request before it left the computer (a CORS issue), not anything
+wrong with your domain or Render setup. This version of server.js
+already includes the fix (CORS headers + OPTIONS preflight
+handling) — if you deployed an earlier copy, replace server.js
+with this one, push to GitHub, let Render redeploy, then:
   1. Open the BMS desktop app → Settings → 🌐 Card Hosting →
      confirm the Hosted Service URL exactly matches your live
      URL (no trailing slash) and Save again.
@@ -167,10 +246,13 @@ GitHub, let Render redeploy, then:
 
 Other things worth checking:
   • Visiting https://<your-domain>/healthz should return JSON
-    with "ok": true.
+    with "ok": true, and "storage": "mongodb" once you've set
+    MONGODB_URI.
   • On Render's free tier, the service can "sleep" after periods
-    of no traffic and take a few seconds to wake up on the first
-    request — this is normal, just wait and try again.
+    of no traffic and take 30-60 seconds to wake up on the first
+    request — this is normal (see "ELIMINATING COLD-START DELAYS"
+    above), just wait and try again, or use the paid Starter tier
+    to remove this entirely.
   • Make sure the Digital Business Card add-on is actually
     approved for the account you're testing with (Licensing →
     🪪), unless you're signed in as the Beat Digital owner, who
