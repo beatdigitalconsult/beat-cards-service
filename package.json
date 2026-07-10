@@ -1,7 +1,7 @@
 {
   "name": "beat-cards-hosting-service",
-  "version": "2.0.0",
-  "description": "Beat Management System (by Beat Digital Consult) — hosted public profile service for Digital Business Cards and Premium Staff ID verification. Every card/ID gets a permanent public link backed by durable storage (Upstash Redis when configured); scanning a QR code opens a full, live profile page.",
+  "version": "2.1.0",
+  "description": "Beat Management System (by Beat Digital Consult) — hosted public profile service for Digital Business Cards. Every card gets a permanent public link; scanning a card's QR code opens a full, live profile page.",
   "main": "server.js",
   "engines": { "node": ">=18.0.0" },
   "scripts": {
@@ -10,6 +10,7 @@
   "license": "UNLICENSED",
   "author": "Beat Digital Consult",
   "dependencies": {
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "mongodb": "^6.10.0"
   }
 }

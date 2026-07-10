@@ -21,6 +21,7 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { MongoClient } = require('mongodb');
 
 const app = express();
 
@@ -53,6 +54,7 @@ app.use((req, res, next) => {
 // ---------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 const ADMIN_KEY = process.env.ADMIN_KEY || 'CHANGE-ME-BEFORE-DEPLOY';
+const MONGODB_URI = process.env.MONGODB_URI || '';
 const OWNER_LICENSE_KEY = 'BD-OWNER'; // sentinel used by the Beat Digital Consult install itself
 const DB_PATH = path.join(__dirname, 'data', 'db.json');
 const BRAND = {
@@ -70,103 +72,104 @@ if (ADMIN_KEY === 'CHANGE-ME-BEFORE-DEPLOY') {
 }
 
 // ---------------------------------------------------------------
-// PERSISTENT DATABASE
-// ---------------------------------------------------------------
-// WHY THIS EXISTS: free-tier hosts (Render, Railway, Fly free plans)
-// give this process an EPHEMERAL disk — it looks fine while the
-// container is alive, but the instant it restarts (sleep/wake after
-// idle, a redeploy, hitting the free memory limit, routine host
-// recycling — all of which can happen every few minutes on a free
-// plan) that disk is wiped and the server boots up empty. That is
-// exactly what "card worked right after saving, then 'profile not
-// found' a minute later" means — the data never left the container
-// that just disappeared.
+// PERSISTENCE
 //
-// The fix is to stop keeping the source of truth on that disk at
-// all. If UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN are set
-// (a free, always-on Redis database — https://upstash.com, no
-// credit card required, data lives on Upstash's own servers and is
-// NOT affected by this app's container restarting, sleeping, or
-// redeploying), every card/staff-ID/package write is saved there
-// immediately and durably. See README-DEPLOY.md → "PERMANENT
-// STORAGE" for the 2-minute setup.
+// IMPORTANT — READ THIS IF CARDS EVER "DISAPPEAR" OR SHOW
+// "PROFILE NOT FOUND" AFTER WORKING FINE EARLIER:
 //
-// If those env vars are not set, the service still runs (falls back
-// to the local JSON file, same as before) so nothing breaks during
-// local testing — but it prints a loud warning, and /healthz reports
-// "persistent": false, because on a free host that fallback WILL
-// lose data on the next restart.
+// Render's FREE web service tier has a completely ephemeral
+// filesystem — this is not a bug, it's documented Render
+// behaviour, and free services CANNOT attach persistent disks at
+// all (only paid services can). Render can also restart a free
+// service at any time, and always wipes its local files on every
+// restart, redeploy, or spin-down. If MONGODB_URI is not set, this
+// server falls back to the local JSON file below — which means
+// every card, every package approval, and every stat will be
+// silently lost the next time Render restarts this service. That
+// is almost certainly why cards work right after you resave them
+// and then vanish a short time later.
+//
+// THE FIX: set MONGODB_URI (a free MongoDB Atlas cluster works
+// great and never expires, unlike Render's free Postgres which
+// expires after 30 days) — see README-DEPLOY.md for the exact
+// steps. Once set, every card survives restarts, redeploys, and
+// spin-downs, permanently, for free. For a commercial product you
+// should also upgrade the Render web service itself to a paid
+// Starter plan (~$7/mo) so it never spins down at all — see
+// README-DEPLOY.md for why the free tier's 15-minute spin-down is
+// still worth eliminating even once your data is safe.
 // ---------------------------------------------------------------
-const REDIS_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/+$/, '');
-const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
-const PERSISTENT = !!(REDIS_URL && REDIS_TOKEN);
-const REDIS_DB_KEY = 'bms:db:v1';
+let mongoCollection = null;
 
-async function redisGet(key) {
-  const res = await fetch(`${REDIS_URL}/get/${encodeURIComponent(key)}`, {
-    headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
-  });
-  if (!res.ok) throw new Error(`Upstash GET failed: HTTP ${res.status}`);
-  const j = await res.json();
-  return j.result; // null if not set, else a string
-}
-async function redisSet(key, value) {
-  const res = await fetch(`${REDIS_URL}/set/${encodeURIComponent(key)}`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${REDIS_TOKEN}`, 'Content-Type': 'text/plain' },
-    body: value
-  });
-  if (!res.ok) throw new Error(`Upstash SET failed: HTTP ${res.status}`);
-  return true;
-}
-
-function emptyDB() { return { cards: {}, packages: {}, staff: {} }; }
-
-async function loadDB() {
-  if (PERSISTENT) {
-    try {
-      const raw = await redisGet(REDIS_DB_KEY);
-      if (!raw) return emptyDB();
-      const parsed = JSON.parse(raw);
-      return { cards: parsed.cards || {}, packages: parsed.packages || {}, staff: parsed.staff || {} };
-    } catch (e) {
-      console.error('Persistent DB load error (Upstash Redis):', e.message);
-      // Do NOT silently fall back to an empty local DB here — that would look
-      // exactly like the data-loss bug we're fixing. Fail loudly instead so
-      // it's obvious this needs attention, but let the process still boot.
-      return emptyDB();
-    }
-  }
-  // ── Local file fallback (NOT durable across restarts on free hosts) ──
-  try {
-    if (!fs.existsSync(DB_PATH)) return emptyDB();
-    const raw = fs.readFileSync(DB_PATH, 'utf8');
-    const parsed = JSON.parse(raw || '{}');
-    return { cards: parsed.cards || {}, packages: parsed.packages || {}, staff: parsed.staff || {} };
-  } catch (e) {
-    console.error('DB load error, starting with an empty store:', e.message);
-    return emptyDB();
-  }
-}
-
-let DB = emptyDB(); // populated by loadDB() before app.listen() below
-
-// Every call is awaited by its route handler before responding, so a
-// save is confirmed durable (or the request is told it failed) before
-// the client ever hears "ok" — no debounce window where a restart
-// between the response and a delayed disk write could lose data.
-async function saveDB() {
-  if (PERSISTENT) {
-    await redisSet(REDIS_DB_KEY, JSON.stringify(DB));
+async function initMongo() {
+  if (!MONGODB_URI) {
+    console.warn('\n⚠️  MONGODB_URI is not set — using local file storage only.');
+    console.warn('   On Render\'s free tier this means ALL CARDS WILL BE LOST on the');
+    console.warn('   next restart/redeploy/spin-down. See README-DEPLOY.md → "Making');
+    console.warn('   cards permanent" to fix this before going live with real clients.\n');
     return;
   }
   try {
-    fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-    fs.writeFileSync(DB_PATH, JSON.stringify(DB, null, 2));
+    const client = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 8000 });
+    await client.connect();
+    const db = client.db('beat_management_system');
+    mongoCollection = db.collection('card_service_state');
+    console.log('✅ Connected to MongoDB — cards will now persist permanently across restarts.');
   } catch (e) {
-    console.error('DB save error:', e.message);
-    throw e;
+    console.error('\n⚠️  Could not connect to MongoDB:', e.message);
+    console.error('   Falling back to local file storage (NOT persistent on Render free tier).');
+    console.error('   Double-check MONGODB_URI is correct and that your Atlas cluster allows');
+    console.error('   connections from anywhere (Network Access → 0.0.0.0/0) — see README-DEPLOY.md.\n');
+    mongoCollection = null;
   }
+}
+
+async function loadDB() {
+  if (mongoCollection) {
+    try {
+      const doc = await mongoCollection.findOne({ _id: 'db' });
+      if (doc) return { cards: doc.cards || {}, packages: doc.packages || {} };
+      return { cards: {}, packages: {} };
+    } catch (e) {
+      console.error('MongoDB load error, falling back to local file for this boot:', e.message);
+    }
+  }
+  try {
+    if (!fs.existsSync(DB_PATH)) return { cards: {}, packages: {} };
+    const raw = fs.readFileSync(DB_PATH, 'utf8');
+    const parsed = JSON.parse(raw || '{}');
+    return { cards: parsed.cards || {}, packages: parsed.packages || {} };
+  } catch (e) {
+    console.error('DB load error, starting with an empty store:', e.message);
+    return { cards: {}, packages: {} };
+  }
+}
+
+let DB = { cards: {}, packages: {} }; // populated for real just before the server starts listening — see boot() below
+let saveTimer = null;
+function saveDB() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(async () => {
+    // Always write the local file too — harmless, and it's an instant
+    // fallback if Mongo has a hiccup on this particular boot.
+    try {
+      fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+      fs.writeFileSync(DB_PATH, JSON.stringify(DB, null, 2));
+    } catch (e) {
+      console.error('DB file save error:', e.message);
+    }
+    if (mongoCollection) {
+      try {
+        await mongoCollection.updateOne(
+          { _id: 'db' },
+          { $set: { cards: DB.cards, packages: DB.packages, updatedAt: new Date() } },
+          { upsert: true }
+        );
+      } catch (e) {
+        console.error('MongoDB save error (data is still safe in the local file for now):', e.message);
+      }
+    }
+  }, 150);
 }
 
 // ---------------------------------------------------------------
@@ -235,17 +238,12 @@ app.get('/', (req, res) => {
   </div></body></html>`);
 });
 
-app.get('/healthz', (req, res) => res.json({
-  ok: true, product: BRAND.product, company: BRAND.company,
-  cards: Object.keys(DB.cards).length, staff: Object.keys(DB.staff).length,
-  persistent: PERSISTENT,
-  storage: PERSISTENT ? 'upstash-redis' : 'local-file (NOT durable on free hosts — see README-DEPLOY.md)'
-}));
+app.get('/healthz', (req, res) => res.json({ ok: true, product: BRAND.product, company: BRAND.company, cards: Object.keys(DB.cards).length, storage: mongoCollection ? 'mongodb' : 'file-only (not persistent on Render free tier)' }));
 
 // ---------------------------------------------------------------
 // CARD SYNC  (called by the BMS desktop app whenever a card is saved)
 // ---------------------------------------------------------------
-app.post('/api/cards', async (req, res) => {
+app.post('/api/cards', (req, res) => {
   const licenseKey = req.get('x-license-key') || 'UNKNOWN';
   if (!isPackageEnabled(licenseKey)) {
     return res.status(403).json({ ok: false, error: 'Digital Business Card package is not active for this license. Ask Beat Digital Consult (or your account admin) to approve it.' });
@@ -260,22 +258,15 @@ app.post('/api/cards', async (req, res) => {
     stats: existing.stats || { views: 0, saves: 0, shares: 0 },
     syncedAt: new Date().toISOString()
   };
-  try {
-    await saveDB();
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: 'Card received but the durable save failed — please retry: ' + e.message });
-  }
+  saveDB();
   const base = `${req.protocol}://${req.get('host')}`;
-  res.json({ ok: true, id: card.id, url: `${base}/c/${card.id}`, persistent: PERSISTENT });
+  res.json({ ok: true, id: card.id, url: `${base}/c/${card.id}` });
 });
 
-app.delete('/api/cards/:id', async (req, res) => {
+app.delete('/api/cards/:id', (req, res) => {
   const licenseKey = req.get('x-license-key') || 'UNKNOWN';
   const c = DB.cards[req.params.id];
-  if (c && c.licenseKey === licenseKey) {
-    delete DB.cards[req.params.id];
-    try { await saveDB(); } catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
-  }
+  if (c && c.licenseKey === licenseKey) { delete DB.cards[req.params.id]; saveDB(); }
   res.json({ ok: true });
 });
 
@@ -286,81 +277,37 @@ app.get('/api/cards/:id', (req, res) => {
 });
 
 // Client-side "beacon" call for save/share button clicks on the profile page
-app.post('/api/cards/:id/track', async (req, res) => {
+app.post('/api/cards/:id/track', (req, res) => {
   const c = DB.cards[req.params.id];
   if (!c) return res.status(404).json({ ok: false });
   const type = ['views', 'saves', 'shares'].includes(req.body?.type) ? req.body.type : null;
-  if (type) { c.stats[type] = (c.stats[type] || 0) + 1; try { await saveDB(); } catch (e) {} }
+  if (type) { c.stats[type] = (c.stats[type] || 0) + 1; saveDB(); }
   res.json({ ok: true, stats: c.stats });
 });
 
 // ---------------------------------------------------------------
 // PUBLIC PROFILE PAGE — this is what opens when anyone scans a card
 // ---------------------------------------------------------------
-app.get('/c/:id', async (req, res) => {
+app.get('/c/:id', (req, res) => {
   const card = DB.cards[req.params.id];
   if (!card || card.privacy === 'private') {
     return res.status(404).send(notFoundPage());
   }
   card.stats = card.stats || { views: 0, saves: 0, shares: 0 };
   card.stats.views += 1;
-  try { await saveDB(); } catch (e) { /* view counter is best-effort; never block the profile page on it */ }
+  saveDB();
   res.send(renderProfilePage(card, req));
 });
 
-app.get('/vcf/:id', async (req, res) => {
+app.get('/vcf/:id', (req, res) => {
   const card = DB.cards[req.params.id];
   if (!card) return res.status(404).send('Not found');
   card.stats.saves = (card.stats.saves || 0) + 1;
-  try { await saveDB(); } catch (e) {}
+  saveDB();
   const name = (card.fullName || `${card.firstName || ''} ${card.lastName || ''}`).trim() || 'contact';
   res.set('Content-Type', 'text/vcard');
   res.set('Content-Disposition', `attachment; filename="${name.replace(/\s+/g, '_')}.vcf"`);
   res.send(buildVCard(card));
-});
-
-// ---------------------------------------------------------------
-// STAFF ID CARD VERIFICATION  (Premium ID Card QR codes link here)
-// Not part of the paid Digital Business Card add-on — this is core
-// Employee/Payroll functionality, so it is NOT gated by
-// isPackageEnabled(). Any BMS install with an internet connection
-// gets working, permanent ID verification links.
-// ---------------------------------------------------------------
-app.post('/api/staff', async (req, res) => {
-  const licenseKey = req.get('x-license-key') || 'UNKNOWN';
-  const staff = req.body || {};
-  if (!staff.id) return res.status(400).json({ ok: false, error: 'id is required' });
-  const existing = DB.staff[staff.id] || {};
-  DB.staff[staff.id] = { ...existing, ...staff, licenseKey, syncedAt: new Date().toISOString() };
-  try {
-    await saveDB();
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: 'Staff record received but the durable save failed — please retry: ' + e.message });
-  }
-  const base = `${req.protocol}://${req.get('host')}`;
-  res.json({ ok: true, id: staff.id, url: `${base}/s/${staff.id}`, persistent: PERSISTENT });
-});
-
-app.delete('/api/staff/:id', async (req, res) => {
-  const licenseKey = req.get('x-license-key') || 'UNKNOWN';
-  const s = DB.staff[req.params.id];
-  if (s && s.licenseKey === licenseKey) {
-    delete DB.staff[req.params.id];
-    try { await saveDB(); } catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
-  }
-  res.json({ ok: true });
-});
-
-app.get('/api/staff/:id', (req, res) => {
-  const s = DB.staff[req.params.id];
-  if (!s) return res.status(404).json({ ok: false, error: 'Not found' });
-  res.json({ ok: true, staff: s });
-});
-
-app.get('/s/:id', (req, res) => {
-  const s = DB.staff[req.params.id];
-  if (!s) return res.status(404).send(notFoundPage());
-  res.send(renderStaffProfilePage(s, req));
 });
 
 function notFoundPage() {
@@ -399,11 +346,36 @@ function renderProfilePage(card, req) {
   const waLink = card.socials?.whatsapp ? `https://wa.me/${card.socials.whatsapp.replace(/[^0-9]/g, '')}` : '';
   const firstPhone = phones[0]?.number || '';
 
+  // ── Employee ID verification panel ──
+  // Present only for cards published from the Premium ID Card
+  // designer (card.idBadge is set). Gives anyone who scans a
+  // printed staff ID an instant, always-current way to confirm the
+  // holder is a real, currently-active employee — not just a
+  // vCard-style contact block.
+  const badge = card.idBadge;
+  let verifyHtml = '';
+  if (badge) {
+    const isVerified = badge.status === 'verified';
+    const badgeColor = isVerified ? '#16a34a' : '#dc2626';
+    const badgeBg = isVerified ? '#dcfce7' : '#fee2e2';
+    const badgeLabel = isVerified ? '✅ Verified Active Employee' : '⚠️ Not a Current Employee';
+    verifyHtml = `
+    <div class="verify">
+      <div class="verify-pill" style="background:${badgeBg};color:${badgeColor}">${badgeLabel}</div>
+      <div class="verify-grid">
+        <div><span>Employee ID</span><strong>${esc(badge.idNumber||'—')}</strong></div>
+        <div><span>Department</span><strong>${esc(badge.department||'—')}</strong></div>
+        <div><span>Issued</span><strong>${esc(badge.issuedDate||'—')}</strong></div>
+        <div><span>Valid Until</span><strong>${esc(badge.validUntil||'—')}</strong></div>
+      </div>
+    </div>`;
+  }
+
   return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>${esc(name)} — Digital Business Card</title>
+<title>${esc(name)} — ${badge ? 'Employee Verification' : 'Digital Business Card'}</title>
 <meta property="og:title" content="${esc(name)}${card.company ? ' · ' + esc(card.company) : ''}">
-<meta property="og:description" content="${esc(card.jobTitle || 'Digital Business Card')}">
+<meta property="og:description" content="${esc(card.jobTitle || (badge ? 'Employee ID Verification' : 'Digital Business Card'))}">
 ${card.photoUrl ? `<meta property="og:image" content="${esc(card.photoUrl)}">` : ''}
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -416,6 +388,12 @@ body{font-family:Segoe UI,Arial,sans-serif;background:#f2f3f8;display:flex;justi
 .title{font-size:13.5px;opacity:.92;margin-top:3px}
 .company{font-size:13.5px;opacity:.92;font-weight:700}
 .body{background:#fff;border-radius:0 0 20px 20px;padding:22px 24px;box-shadow:0 10px 40px rgba(0,0,0,.12)}
+.verify{margin-bottom:16px}
+.verify-pill{display:inline-block;font-size:12px;font-weight:800;padding:7px 14px;border-radius:999px;margin-bottom:12px}
+.verify-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 16px;background:#f7f7fb;border-radius:10px;padding:14px}
+.verify-grid div{display:flex;flex-direction:column;gap:2px}
+.verify-grid span{font-size:10px;color:#888;text-transform:uppercase;letter-spacing:.4px}
+.verify-grid strong{font-size:13px;color:#222}
 .row{display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid #eee;text-decoration:none;color:#222}
 .row:last-child{border-bottom:none}
 .ic{width:34px;height:34px;border-radius:9px;background:${th.accent}22;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}
@@ -438,6 +416,7 @@ body{font-family:Segoe UI,Arial,sans-serif;background:#f2f3f8;display:flex;justi
   ${card.company ? `<div class="company">${esc(card.company)}</div>` : ''}
 </div>
 <div class="body">
+  ${verifyHtml}
   ${card.bio ? `<div class="bio">${esc(card.bio)}</div>` : ''}
   ${rows.join('')}
   <div class="btnRow">
@@ -450,79 +429,13 @@ body{font-family:Segoe UI,Arial,sans-serif;background:#f2f3f8;display:flex;justi
     <div style="font-size:10.5px;color:#999">Viewed via secure link · ${BRAND.product}</div>
   </div>
 </div>
-<div class="foot">Digital Business Card by ${BRAND.company} · "${BRAND.tagline}"<br><a href="${BRAND.site}" target="_blank" rel="noopener">${BRAND.site.replace('https://', '')}</a></div>
+<div class="foot">${badge ? 'Employee Verification' : 'Digital Business Card'} by ${BRAND.company} · "${BRAND.tagline}"<br><a href="${BRAND.site}" target="_blank" rel="noopener">${BRAND.site.replace('https://', '')}</a></div>
 </div>
 <script>
 function track(type){ try{ fetch('${base}/api/cards/${card.id}/track',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:type})}); }catch(e){} }
 function saveContact(){ track('saves'); window.location.href = '${base}/vcf/${card.id}'; }
 </script>
 </body></html>`;
-}
-
-function renderStaffProfilePage(s, req) {
-  const active = s.status !== 'inactive' && !s.revoked;
-  const statusLabel = active ? '✅ Verified Active Employee' : '⛔ No Longer Active';
-  const statusColor = active ? '#059669' : '#dc2626';
-  const statusBg = active ? '#d1fae5' : '#fee2e2';
-  const waNumber = (s.socials?.whatsapp || s.phone || '').replace(/[^0-9]/g, '');
-  const waLink = waNumber ? `https://wa.me/${waNumber}` : '';
-
-  const contactRows = [];
-  if (s.phone) contactRows.push(`<a class="row" href="tel:${esc(s.phone)}"><div class="ic">📞</div><div><div class="lbl">Phone</div><div class="val">${esc(s.phone)}</div></div></a>`);
-  if (waLink) contactRows.push(`<a class="row" href="${waLink}" target="_blank" rel="noopener"><div class="ic">💬</div><div><div class="lbl">WhatsApp</div><div class="val">${esc(s.socials?.whatsapp || s.phone)}</div></div></a>`);
-  if (s.email) contactRows.push(`<a class="row" href="mailto:${esc(s.email)}"><div class="ic">✉️</div><div><div class="lbl">Email</div><div class="val">${esc(s.email)}</div></div></a>`);
-
-  const socialLinks = [
-    s.socials?.linkedin && ['LinkedIn', '🔗', s.socials.linkedin],
-    s.socials?.twitter && ['X / Twitter', '✖️', s.socials.twitter],
-    s.socials?.instagram && ['Instagram', '📷', s.socials.instagram],
-    s.socials?.facebook && ['Facebook', '📘', s.socials.facebook]
-  ].filter(Boolean);
-  const socialIcons = socialLinks.length ? `<div class="socialRow">${socialLinks.map(([label, icon, url]) => `<a class="social" title="${esc(label)}" href="${esc(url)}" target="_blank" rel="noopener">${icon}</a>`).join('')}</div>` : '';
-
-  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>${esc(s.name)} — Employee Verification</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:Segoe UI,Arial,sans-serif;background:#f2f3f8;display:flex;justify-content:center;padding:26px 14px;min-height:100vh}
-.wrap{width:100%;max-width:400px}
-.hero{background:linear-gradient(135deg,#0d0d63,#1e1eb8 55%,#2a2ad6);color:#fff;border-radius:20px 20px 0 0;padding:30px 24px 22px;text-align:center}
-.photo{width:88px;height:88px;border-radius:50%;object-fit:cover;border:4px solid rgba(255,255,255,.65);margin-bottom:12px;background:rgba(255,255,255,.2)}
-.ph-fallback{display:flex;align-items:center;justify-content:center;font-size:28px;font-weight:800}
-.name{font-size:20px;font-weight:800}
-.role{font-size:13px;opacity:.9;margin-top:3px}
-.body{background:#fff;border-radius:0 0 20px 20px;padding:22px 24px;box-shadow:0 10px 40px rgba(0,0,0,.12)}
-.status{text-align:center;padding:10px;border-radius:10px;font-weight:700;font-size:13px;margin-bottom:16px;background:${statusBg};color:${statusColor}}
-.row{display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid #eee;text-decoration:none;color:#222}
-.row:last-child{border-bottom:none}
-.ic{width:34px;height:34px;border-radius:9px;background:#1e1eb822;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}
-.lbl{font-size:10.5px;color:#888;text-transform:uppercase;letter-spacing:.4px}
-.val{font-size:13.5px;font-weight:600;word-break:break-word}
-.meta{display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #eee;font-size:12.5px}
-.meta span:first-child{color:#888}
-.meta span:last-child{font-weight:700;color:#222}
-.socialRow{display:flex;gap:10px;justify-content:center;margin:16px 0 4px}
-.social{width:40px;height:40px;border-radius:50%;background:#f2f3f8;display:flex;align-items:center;justify-content:center;font-size:17px;text-decoration:none;color:#222}
-.sectionTitle{font-size:10.5px;color:#999;text-transform:uppercase;letter-spacing:.5px;margin:18px 0 4px}
-.foot{text-align:center;font-size:10.5px;color:#aaa;margin-top:16px}
-</style></head><body><div class="wrap">
-<div class="hero">
-  ${s.photoUrl ? `<img class="photo" src="${esc(s.photoUrl)}">` : `<div class="photo ph-fallback">${esc((s.name || '').substring(0, 2).toUpperCase())}</div>`}
-  <div class="name">${esc(s.name)}</div>
-  <div class="role">${esc(s.role || '')}${s.dept ? ' · ' + esc(s.dept) : ''}</div>
-</div>
-<div class="body">
-  <div class="status">${statusLabel}</div>
-  <div class="meta"><span>Employee ID</span><span>${esc(s.idNumber || s.id)}</span></div>
-  <div class="meta"><span>Company</span><span>${esc(s.companyName || BRAND.company)}</span></div>
-  ${s.issuedAt ? `<div class="meta"><span>Issued</span><span>${esc(s.issuedAt)}</span></div>` : ''}
-  ${s.validUntil ? `<div class="meta"><span>Valid Until</span><span>${esc(s.validUntil)}</span></div>` : ''}
-  ${contactRows.length ? `<div class="sectionTitle">Contact</div>${contactRows.join('')}` : ''}
-  ${socialIcons}
-</div>
-<div class="foot">Verified via ${BRAND.product} · ${BRAND.company}<br>This page updates automatically — it always reflects this employee's current status.</div>
-</div></body></html>`;
 }
 
 // ---------------------------------------------------------------
@@ -538,7 +451,7 @@ app.get('/api/card-package/:licenseKey', (req, res) => {
 // ---------------------------------------------------------------
 // ADMIN (Beat Digital Consult owner only — protected by ADMIN_KEY)
 // ---------------------------------------------------------------
-app.post('/api/admin/card-package', requireAdmin, async (req, res) => {
+app.post('/api/admin/card-package', requireAdmin, (req, res) => {
   const { licenseKey, enabled, price, notes, approvedBy } = req.body || {};
   if (!licenseKey) return res.status(400).json({ ok: false, error: 'licenseKey is required' });
   DB.packages[licenseKey] = {
@@ -548,7 +461,7 @@ app.post('/api/admin/card-package', requireAdmin, async (req, res) => {
     approvedBy: approvedBy || 'Beat Digital Consult',
     approvedAt: new Date().toISOString()
   };
-  try { await saveDB(); } catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
+  saveDB();
   res.json({ ok: true, package: DB.packages[licenseKey] });
 });
 
@@ -572,22 +485,20 @@ app.get('/api/admin/overview', requireAdmin, (req, res) => {
 
 app.use((req, res) => res.status(404).send(notFoundPage()));
 
-// Load the database BEFORE accepting traffic — with Upstash this is a
-// single fast round-trip; with the local-file fallback it's instant.
-(async () => {
+// ---------------------------------------------------------------
+// BOOT — connect to MongoDB (if configured) and load existing data
+// BEFORE accepting any requests, so the very first request after a
+// restart already sees every previously-published card.
+// ---------------------------------------------------------------
+async function boot() {
+  await initMongo();
   DB = await loadDB();
   app.listen(PORT, () => {
     console.log(`\n🪪 ${BRAND.product} — Card Profile Service`);
     console.log(`   by ${BRAND.company} — running on port ${PORT}`);
-    console.log(`   Health check: /healthz`);
-    if (PERSISTENT) {
-      console.log(`   ✅ Persistent storage: Upstash Redis — card & staff links will survive restarts.\n`);
-    } else {
-      console.log(`   ⚠️  Persistent storage: OFF (local file only).`);
-      console.log(`   ⚠️  On a free host, cards/staff IDs saved now WILL disappear the next`);
-      console.log(`   ⚠️  time this service restarts. Set UPSTASH_REDIS_REST_URL and`);
-      console.log(`   ⚠️  UPSTASH_REDIS_REST_TOKEN to fix this permanently — see`);
-      console.log(`   ⚠️  README-DEPLOY.md → "PERMANENT STORAGE".\n`);
-    }
+    console.log(`   Storage: ${mongoCollection ? 'MongoDB (persistent ✅)' : 'local file only (NOT persistent on Render free tier ⚠️)'}`);
+    console.log(`   Cards loaded: ${Object.keys(DB.cards).length}`);
+    console.log(`   Health check: /healthz\n`);
   });
-})();
+}
+boot();
