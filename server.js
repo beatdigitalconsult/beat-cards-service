@@ -50,10 +50,58 @@ app.use((req, res, next) => {
 });
 
 // ---------------------------------------------------------------
+// BASIC SECURITY HEADERS (hand-rolled, no extra dependency — a
+// production deploy could swap this for the `helmet` package, but
+// this covers the essentials for a small service like this one)
+// ---------------------------------------------------------------
+app.use((req, res, next) => {
+  res.header('X-Content-Type-Options', 'nosniff');
+  res.header('X-Frame-Options', 'DENY');
+  res.header('Referrer-Policy', 'strict-origin-when-cross-origin');
+  next();
+});
+
+// ---------------------------------------------------------------
+// RATE LIMITING (hand-rolled in-memory sliding window — good enough
+// for a single-instance deploy on Render/Railway/Fly's free tiers;
+// swap for a Redis-backed limiter if you ever run multiple instances)
+// ---------------------------------------------------------------
+function makeRateLimiter({ windowMs, max }) {
+  const hits = new Map(); // ip -> [timestamps]
+  return (req, res, next) => {
+    const ip = req.ip || req.connection?.remoteAddress || 'unknown';
+    const now = Date.now();
+    const arr = (hits.get(ip) || []).filter(t => now - t < windowMs);
+    arr.push(now);
+    hits.set(ip, arr);
+    if (arr.length > max) {
+      return res.status(429).json({ ok: false, error: 'Too many requests — please slow down and try again shortly.' });
+    }
+    next();
+  };
+}
+// Generous limit for normal card scans/publishes, tighter for admin
+// endpoints where hits should be rare and deliberate.
+const publicLimiter = makeRateLimiter({ windowMs: 60 * 1000, max: 120 });
+const adminLimiter = makeRateLimiter({ windowMs: 60 * 1000, max: 30 });
+app.use('/api/admin', adminLimiter);
+app.use(publicLimiter);
+
+// ---------------------------------------------------------------
 // CONFIG
 // ---------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
-const ADMIN_KEY = process.env.ADMIN_KEY || 'CHANGE-ME-BEFORE-DEPLOY';
+// If ADMIN_KEY isn't set in the environment, generate a strong random
+// one for this boot instead of falling back to a fixed, guessable
+// string. This closes the "forgot to set it" hole — a fixed default
+// left in place would let anyone approve/revoke Digital Card
+// packages for any client. A freshly-generated key still needs to be
+// set as a persistent env var (it changes every restart otherwise,
+// which will lock the owner app out of admin actions) — the boot log
+// below prints it once, loudly, so it can be copied into Render/
+// Railway/Fly's environment variable settings.
+const ADMIN_KEY = process.env.ADMIN_KEY || crypto.randomBytes(24).toString('hex');
+const ADMIN_KEY_WAS_GENERATED = !process.env.ADMIN_KEY;
 const MONGODB_URI = process.env.MONGODB_URI || '';
 const OWNER_LICENSE_KEY = 'BD-OWNER'; // sentinel used by the Beat Digital Consult install itself
 const DB_PATH = path.join(__dirname, 'data', 'db.json');
@@ -65,10 +113,14 @@ const BRAND = {
   supportEmail: 'admin@beatdigital.tech'
 };
 
-if (ADMIN_KEY === 'CHANGE-ME-BEFORE-DEPLOY') {
-  console.warn('\n⚠️  WARNING: ADMIN_KEY environment variable is not set.');
-  console.warn('   Set a strong ADMIN_KEY before going live — it protects the');
-  console.warn('   Digital Card Package approval endpoints used by the owner app.\n');
+if (ADMIN_KEY_WAS_GENERATED) {
+  console.warn('\n⚠️  ADMIN_KEY environment variable is not set — generated a');
+  console.warn('   temporary one for THIS BOOT ONLY (it will change on every');
+  console.warn('   restart until you set it permanently):\n');
+  console.warn(`   ADMIN_KEY=${ADMIN_KEY}\n`);
+  console.warn('   Set this as a persistent environment variable on your host');
+  console.warn('   (Render/Railway/Fly → Environment) and paste the SAME value');
+  console.warn('   into the BMS desktop app under Settings → 🌐 Card Hosting.\n');
 }
 
 // ---------------------------------------------------------------
@@ -128,24 +180,24 @@ async function loadDB() {
   if (mongoCollection) {
     try {
       const doc = await mongoCollection.findOne({ _id: 'db' });
-      if (doc) return { cards: doc.cards || {}, packages: doc.packages || {} };
-      return { cards: {}, packages: {} };
+      if (doc) return { cards: doc.cards || {}, packages: doc.packages || {}, auditLog: doc.auditLog || [] };
+      return { cards: {}, packages: {}, auditLog: [] };
     } catch (e) {
       console.error('MongoDB load error, falling back to local file for this boot:', e.message);
     }
   }
   try {
-    if (!fs.existsSync(DB_PATH)) return { cards: {}, packages: {} };
+    if (!fs.existsSync(DB_PATH)) return { cards: {}, packages: {}, auditLog: [] };
     const raw = fs.readFileSync(DB_PATH, 'utf8');
     const parsed = JSON.parse(raw || '{}');
-    return { cards: parsed.cards || {}, packages: parsed.packages || {} };
+    return { cards: parsed.cards || {}, packages: parsed.packages || {}, auditLog: parsed.auditLog || [] };
   } catch (e) {
     console.error('DB load error, starting with an empty store:', e.message);
-    return { cards: {}, packages: {} };
+    return { cards: {}, packages: {}, auditLog: [] };
   }
 }
 
-let DB = { cards: {}, packages: {} }; // populated for real just before the server starts listening — see boot() below
+let DB = { cards: {}, packages: {}, auditLog: [] }; // populated for real just before the server starts listening — see boot() below
 let saveTimer = null;
 function saveDB() {
   clearTimeout(saveTimer);
@@ -162,7 +214,7 @@ function saveDB() {
       try {
         await mongoCollection.updateOne(
           { _id: 'db' },
-          { $set: { cards: DB.cards, packages: DB.packages, updatedAt: new Date() } },
+          { $set: { cards: DB.cards, packages: DB.packages, auditLog: DB.auditLog || [], updatedAt: new Date() } },
           { upsert: true }
         );
       } catch (e) {
@@ -243,12 +295,41 @@ app.get('/healthz', (req, res) => res.json({ ok: true, product: BRAND.product, c
 // ---------------------------------------------------------------
 // CARD SYNC  (called by the BMS desktop app whenever a card is saved)
 // ---------------------------------------------------------------
+// Basic shape/size validation — this is not a substitute for real
+// per-user auth (see the note on isPackageEnabled/licenseKey below),
+// but it stops obviously malformed or oversized payloads from being
+// stored and served back to the public.
+const CARD_FIELD_LIMITS = {
+  firstName: 100, lastName: 100, fullName: 150, jobTitle: 150, company: 150,
+  department: 100, bio: 1000, website: 500, address: 300
+};
+function validateCardPayload(card) {
+  for (const [field, max] of Object.entries(CARD_FIELD_LIMITS)) {
+    if (card[field] != null && String(card[field]).length > max) {
+      return `Field "${field}" exceeds the maximum length of ${max} characters.`;
+    }
+  }
+  if (card.phones && (!Array.isArray(card.phones) || card.phones.length > 10)) return 'Too many phone numbers.';
+  if (card.emails && (!Array.isArray(card.emails) || card.emails.length > 10)) return 'Too many email addresses.';
+  return null;
+}
+
 app.post('/api/cards', (req, res) => {
   const licenseKey = req.get('x-license-key') || 'UNKNOWN';
   if (!isPackageEnabled(licenseKey)) {
     return res.status(403).json({ ok: false, error: 'Digital Business Card package is not active for this license. Ask Beat Digital Consult (or your account admin) to approve it.' });
   }
   const card = req.body || {};
+  const validationError = validateCardPayload(card);
+  if (validationError) return res.status(400).json({ ok: false, error: validationError });
+
+  // A card can only be updated by the license key that owns it — a
+  // license key can't overwrite another license's existing card by
+  // guessing/reusing its id.
+  if (card.id && DB.cards[card.id] && DB.cards[card.id].licenseKey !== licenseKey) {
+    return res.status(403).json({ ok: false, error: 'This card belongs to a different license.' });
+  }
+
   if (!card.id) card.id = newId();
   const existing = DB.cards[card.id] || {};
   DB.cards[card.id] = {
@@ -479,6 +560,7 @@ app.get('/api/card-package/:licenseKey', (req, res) => {
 app.post('/api/admin/card-package', requireAdmin, (req, res) => {
   const { licenseKey, enabled, price, notes, approvedBy } = req.body || {};
   if (!licenseKey) return res.status(400).json({ ok: false, error: 'licenseKey is required' });
+  const before = DB.packages[licenseKey] || null;
   DB.packages[licenseKey] = {
     enabled: !!enabled,
     price: price || null,
@@ -486,8 +568,22 @@ app.post('/api/admin/card-package', requireAdmin, (req, res) => {
     approvedBy: approvedBy || 'Beat Digital Consult',
     approvedAt: new Date().toISOString()
   };
+  DB.auditLog = DB.auditLog || [];
+  DB.auditLog.unshift({
+    at: new Date().toISOString(),
+    action: enabled ? 'approve' : 'revoke',
+    licenseKey,
+    before,
+    after: DB.packages[licenseKey]
+  });
+  DB.auditLog = DB.auditLog.slice(0, 500); // keep this bounded
   saveDB();
   res.json({ ok: true, package: DB.packages[licenseKey] });
+});
+
+// Read-only audit trail of package approvals/revocations (owner only)
+app.get('/api/admin/audit-log', requireAdmin, (req, res) => {
+  res.json({ ok: true, auditLog: DB.auditLog || [] });
 });
 
 app.get('/api/admin/card-packages', requireAdmin, (req, res) => {
