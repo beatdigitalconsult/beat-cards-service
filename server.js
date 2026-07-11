@@ -293,6 +293,17 @@ app.get('/c/:id', (req, res) => {
   if (!card || card.privacy === 'private') {
     return res.status(404).send(notFoundPage());
   }
+  // ── SUSPENSION CHECK ──────────────────────────────────
+  // A card (Digital Business Card OR a Premium ID Card's public
+  // verification page — both are served from here) belongs to a
+  // license key. If that license's Digital Card package has been
+  // revoked since the card was published, the public page must stop
+  // resolving immediately — a scanned QR/printed card should not go
+  // on working for a client Beat Digital Consult has cut off. This
+  // is checked live on every scan, not just at publish time.
+  if (!isPackageEnabled(card.licenseKey)) {
+    return res.status(403).send(suspendedPage());
+  }
   card.stats = card.stats || { views: 0, saves: 0, shares: 0 };
   card.stats.views += 1;
   saveDB();
@@ -302,6 +313,9 @@ app.get('/c/:id', (req, res) => {
 app.get('/vcf/:id', (req, res) => {
   const card = DB.cards[req.params.id];
   if (!card) return res.status(404).send('Not found');
+  if (!isPackageEnabled(card.licenseKey)) {
+    return res.status(403).send(suspendedPage());
+  }
   card.stats.saves = (card.stats.saves || 0) + 1;
   saveDB();
   const name = (card.fullName || `${card.firstName || ''} ${card.lastName || ''}`).trim() || 'contact';
@@ -317,6 +331,17 @@ function notFoundPage() {
   .box{max-width:380px}h1{font-size:20px;color:#222}p{color:#666;font-size:13.5px;line-height:1.6}</style>
   </head><body><div class="box"><h1>🔍 Profile not found</h1>
   <p>This card link is invalid, has been removed, or was set to private by its owner.</p>
+  <p style="margin-top:18px;font-size:11.5px;color:#999">${BRAND.product} · ${BRAND.company}</p>
+  </div></body></html>`;
+}
+
+function suspendedPage() {
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Card suspended</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>body{font-family:Segoe UI,Arial,sans-serif;background:#f2f3f8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:center;padding:24px}
+  .box{max-width:380px}h1{font-size:20px;color:#b91c1c}p{color:#666;font-size:13.5px;line-height:1.6}</style>
+  </head><body><div class="box"><h1>⏸️ This card is currently suspended</h1>
+  <p>The Digital Card package for this account is not currently active, so this profile is temporarily unavailable. The card owner should contact ${BRAND.company} to reactivate it.</p>
   <p style="margin-top:18px;font-size:11.5px;color:#999">${BRAND.product} · ${BRAND.company}</p>
   </div></body></html>`;
 }
