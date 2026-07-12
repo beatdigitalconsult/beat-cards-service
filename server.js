@@ -180,24 +180,24 @@ async function loadDB() {
   if (mongoCollection) {
     try {
       const doc = await mongoCollection.findOne({ _id: 'db' });
-      if (doc) return { cards: doc.cards || {}, packages: doc.packages || {}, auditLog: doc.auditLog || [] };
-      return { cards: {}, packages: {}, auditLog: [] };
+      if (doc) return { cards: doc.cards || {}, packages: doc.packages || {}, auditLog: doc.auditLog || [], licenses: doc.licenses || {} };
+      return { cards: {}, packages: {}, auditLog: [], licenses: {} };
     } catch (e) {
       console.error('MongoDB load error, falling back to local file for this boot:', e.message);
     }
   }
   try {
-    if (!fs.existsSync(DB_PATH)) return { cards: {}, packages: {}, auditLog: [] };
+    if (!fs.existsSync(DB_PATH)) return { cards: {}, packages: {}, auditLog: [], licenses: {} };
     const raw = fs.readFileSync(DB_PATH, 'utf8');
     const parsed = JSON.parse(raw || '{}');
-    return { cards: parsed.cards || {}, packages: parsed.packages || {}, auditLog: parsed.auditLog || [] };
+    return { cards: parsed.cards || {}, packages: parsed.packages || {}, auditLog: parsed.auditLog || [], licenses: parsed.licenses || {} };
   } catch (e) {
     console.error('DB load error, starting with an empty store:', e.message);
-    return { cards: {}, packages: {}, auditLog: [] };
+    return { cards: {}, packages: {}, auditLog: [], licenses: {} };
   }
 }
 
-let DB = { cards: {}, packages: {}, auditLog: [] }; // populated for real just before the server starts listening — see boot() below
+let DB = { cards: {}, packages: {}, auditLog: [], licenses: {} }; // populated for real just before the server starts listening — see boot() below
 let saveTimer = null;
 function saveDB() {
   clearTimeout(saveTimer);
@@ -214,7 +214,7 @@ function saveDB() {
       try {
         await mongoCollection.updateOne(
           { _id: 'db' },
-          { $set: { cards: DB.cards, packages: DB.packages, auditLog: DB.auditLog || [], updatedAt: new Date() } },
+          { $set: { cards: DB.cards, packages: DB.packages, auditLog: DB.auditLog || [], licenses: DB.licenses || {}, updatedAt: new Date() } },
           { upsert: true }
         );
       } catch (e) {
@@ -543,6 +543,156 @@ function saveContact(){ track('saves'); window.location.href = '${base}/vcf/${ca
 </script>
 </body></html>`;
 }
+
+// ---------------------------------------------------------------
+// LICENSE REGISTRY — server-authoritative seat/device enforcement
+//
+// WHY THIS EXISTS: the BMS desktop app previously enforced its
+// "1 license = 1 computer" rule entirely inside the client's own
+// browser (localStorage). Anyone with DevTools open on their own
+// machine could edit that data directly and bypass the limit — no
+// server was ever checked. This registry is the fix: it's the one
+// place a technical client CAN'T simply edit their way around,
+// because it runs on a machine they don't control. The desktop app
+// now calls /api/license/:key/checkin on every activation, sign-in,
+// and roughly once a minute while a client session is open, and
+// trusts THIS server's verdict over anything in its own storage.
+//
+// This raises the bar a lot — it can't be beaten by editing
+// localStorage anymore — but it isn't absolute: someone could still
+// intercept/patch the network call itself in a modified client.
+// True tamper-proofing of a fully client-controlled desktop app
+// isn't achievable; this closes the specific, easy bypass.
+// ---------------------------------------------------------------
+const PLAN_CODES = { S: 'starter', P: 'professional', E: 'enterprise', L: 'lifetime' };
+
+function parseLicenseKey(key) {
+  const parts = (key || '').trim().toUpperCase().split('-');
+  if (parts.length !== 6 || parts[0] !== 'BDC') return null;
+  const plan = PLAN_CODES[parts[1]];
+  if (!plan) return null;
+  return { key: parts.join('-'), plan };
+}
+
+function licenseStatusOf(lic) {
+  if (!lic) return 'not-found';
+  if (lic.status !== 'active') return lic.status;
+  if (lic.expiresAt && new Date(lic.expiresAt) < new Date()) return 'expired';
+  return 'active';
+}
+
+// Public: activation / ongoing sign-in verification. Rate-limited by
+// the general publicLimiter above. No admin key needed — a license
+// key by itself only proves you know the key, not that you're the
+// owner, so this endpoint deliberately can't do anything an admin
+// key can (revoke, change plan, etc.) — it can only check in a device
+// against seats that were already provisioned by the owner.
+app.post('/api/license/:key/checkin', (req, res) => {
+  const parsed = parseLicenseKey(req.params.key);
+  if (!parsed) return res.status(400).json({ ok: false, error: 'Invalid license key format.' });
+  const { deviceId, deviceLabel } = req.body || {};
+  if (!deviceId) return res.status(400).json({ ok: false, error: 'deviceId is required.' });
+
+  const lic = DB.licenses[parsed.key];
+  const status = licenseStatusOf(lic);
+  if (status === 'not-found') return res.status(404).json({ ok: false, found: false, error: 'License key not found. Contact admin@beatdigital.tech.' });
+  if (status === 'revoked') return res.status(403).json({ ok: false, found: true, status, error: 'This license has been revoked. Contact admin@beatdigital.tech.' });
+  if (status === 'expired') return res.status(403).json({ ok: false, found: true, status, error: 'This license has expired. Contact admin@beatdigital.tech to renew.' });
+
+  lic.activations = lic.activations || [];
+  const already = lic.activations.find(a => a.deviceId === deviceId);
+  if (already) {
+    already.lastSeenAt = new Date().toISOString();
+    saveDB();
+    return res.json({ ok: true, found: true, status: 'active', plan: lic.plan, maxInstalls: lic.maxInstalls, expiresAt: lic.expiresAt, claimed: false });
+  }
+
+  if (lic.activations.length >= (lic.maxInstalls || 1)) {
+    const activatedOn = lic.activations.map(a => a.deviceLabel || a.deviceId).join(', ');
+    return res.status(403).json({
+      ok: false, found: true, status: 'seat-limit',
+      error: `This license key is already activated on ${lic.activations.length} computer(s) (max: ${lic.maxInstalls || 1}). A license key can only be used on one computer at a time. Ask Beat Digital Consult to transfer it before signing in on this device.`,
+      activatedOn
+    });
+  }
+
+  lic.activations.push({ deviceId, deviceLabel: deviceLabel || 'Unknown device', activatedAt: new Date().toISOString(), lastSeenAt: new Date().toISOString() });
+  DB.auditLog = DB.auditLog || [];
+  DB.auditLog.unshift({ at: new Date().toISOString(), action: 'device-checkin', licenseKey: parsed.key, deviceId, deviceLabel });
+  DB.auditLog = DB.auditLog.slice(0, 500);
+  saveDB();
+  res.json({ ok: true, found: true, status: 'active', plan: lic.plan, maxInstalls: lic.maxInstalls, expiresAt: lic.expiresAt, claimed: true });
+});
+
+// Admin: provision / update a license record. The owner app calls
+// this right after generating a key locally, so a brand-new client
+// machine (whose local storage has never heard of this key) has
+// something authoritative to check in against.
+app.post('/api/admin/licenses', requireAdmin, (req, res) => {
+  const { key, businessName, plan, maxInstalls, expiresAt } = req.body || {};
+  const parsed = parseLicenseKey(key);
+  if (!parsed) return res.status(400).json({ ok: false, error: 'Invalid license key format.' });
+  const existing = DB.licenses[parsed.key];
+  DB.licenses[parsed.key] = {
+    key: parsed.key,
+    businessName: businessName || existing?.businessName || '',
+    plan: plan || existing?.plan || parsed.plan,
+    maxInstalls: maxInstalls || existing?.maxInstalls || 1,
+    status: existing?.status || 'active',
+    expiresAt: expiresAt !== undefined ? expiresAt : (existing?.expiresAt || null),
+    activations: existing?.activations || [],
+    createdAt: existing?.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+  DB.auditLog = DB.auditLog || [];
+  DB.auditLog.unshift({ at: new Date().toISOString(), action: existing ? 'license-update' : 'license-create', licenseKey: parsed.key });
+  DB.auditLog = DB.auditLog.slice(0, 500);
+  saveDB();
+  res.json({ ok: true, license: DB.licenses[parsed.key] });
+});
+
+app.post('/api/admin/licenses/:key/revoke', requireAdmin, (req, res) => {
+  const parsed = parseLicenseKey(req.params.key);
+  if (!parsed || !DB.licenses[parsed.key]) return res.status(404).json({ ok: false, error: 'License not found on server.' });
+  DB.licenses[parsed.key].status = 'revoked';
+  DB.licenses[parsed.key].updatedAt = new Date().toISOString();
+  DB.auditLog = DB.auditLog || [];
+  DB.auditLog.unshift({ at: new Date().toISOString(), action: 'license-revoke', licenseKey: parsed.key });
+  DB.auditLog = DB.auditLog.slice(0, 500);
+  saveDB();
+  res.json({ ok: true, license: DB.licenses[parsed.key] });
+});
+
+app.post('/api/admin/licenses/:key/reactivate', requireAdmin, (req, res) => {
+  const parsed = parseLicenseKey(req.params.key);
+  if (!parsed || !DB.licenses[parsed.key]) return res.status(404).json({ ok: false, error: 'License not found on server.' });
+  DB.licenses[parsed.key].status = 'active';
+  DB.licenses[parsed.key].updatedAt = new Date().toISOString();
+  DB.auditLog = DB.auditLog || [];
+  DB.auditLog.unshift({ at: new Date().toISOString(), action: 'license-reactivate', licenseKey: parsed.key });
+  DB.auditLog = DB.auditLog.slice(0, 500);
+  saveDB();
+  res.json({ ok: true, license: DB.licenses[parsed.key] });
+});
+
+// Clears every activated device for this key so the client can check
+// in fresh on a new computer — the server-side counterpart to the
+// owner app's "Transfer License" button.
+app.post('/api/admin/licenses/:key/transfer', requireAdmin, (req, res) => {
+  const parsed = parseLicenseKey(req.params.key);
+  if (!parsed || !DB.licenses[parsed.key]) return res.status(404).json({ ok: false, error: 'License not found on server.' });
+  DB.licenses[parsed.key].activations = [];
+  DB.licenses[parsed.key].updatedAt = new Date().toISOString();
+  DB.auditLog = DB.auditLog || [];
+  DB.auditLog.unshift({ at: new Date().toISOString(), action: 'license-transfer', licenseKey: parsed.key });
+  DB.auditLog = DB.auditLog.slice(0, 500);
+  saveDB();
+  res.json({ ok: true, license: DB.licenses[parsed.key] });
+});
+
+app.get('/api/admin/licenses', requireAdmin, (req, res) => {
+  res.json({ ok: true, licenses: DB.licenses });
+});
 
 // ---------------------------------------------------------------
 // DIGITAL CARD PACKAGE — approval status (read, public per license)
