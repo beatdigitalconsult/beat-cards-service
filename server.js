@@ -694,6 +694,22 @@ app.get('/api/admin/licenses', requireAdmin, (req, res) => {
   res.json({ ok: true, licenses: DB.licenses });
 });
 
+// Permanently removes a license record from the server, as opposed to
+// /revoke which only flips its status. Without this, a key the owner
+// deletes locally still lives on in DB.licenses forever — and the next
+// background sync (which pulls every server-known key back into local
+// storage) resurrects it right after deletion.
+app.delete('/api/admin/licenses/:key', requireAdmin, (req, res) => {
+  const parsed = parseLicenseKey(req.params.key);
+  if (!parsed || !DB.licenses[parsed.key]) return res.status(404).json({ ok: false, error: 'License not found on server.' });
+  delete DB.licenses[parsed.key];
+  DB.auditLog = DB.auditLog || [];
+  DB.auditLog.unshift({ at: new Date().toISOString(), action: 'license-delete', licenseKey: parsed.key });
+  DB.auditLog = DB.auditLog.slice(0, 500);
+  saveDB();
+  res.json({ ok: true });
+});
+
 // ---------------------------------------------------------------
 // DIGITAL CARD PACKAGE — approval status (read, public per license)
 // ---------------------------------------------------------------
