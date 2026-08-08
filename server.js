@@ -180,24 +180,24 @@ async function loadDB() {
   if (mongoCollection) {
     try {
       const doc = await mongoCollection.findOne({ _id: 'db' });
-      if (doc) return { cards: doc.cards || {}, packages: doc.packages || {}, auditLog: doc.auditLog || [], licenses: doc.licenses || {} };
-      return { cards: {}, packages: {}, auditLog: [], licenses: {} };
+      if (doc) return { cards: doc.cards || {}, packages: doc.packages || {}, auditLog: doc.auditLog || [], licenses: doc.licenses || {}, hubtelStatus: doc.hubtelStatus || {}, businessAuditLog: doc.businessAuditLog || [] };
+      return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [] };
     } catch (e) {
       console.error('MongoDB load error, falling back to local file for this boot:', e.message);
     }
   }
   try {
-    if (!fs.existsSync(DB_PATH)) return { cards: {}, packages: {}, auditLog: [], licenses: {} };
+    if (!fs.existsSync(DB_PATH)) return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [] };
     const raw = fs.readFileSync(DB_PATH, 'utf8');
     const parsed = JSON.parse(raw || '{}');
-    return { cards: parsed.cards || {}, packages: parsed.packages || {}, auditLog: parsed.auditLog || [], licenses: parsed.licenses || {} };
+    return { cards: parsed.cards || {}, packages: parsed.packages || {}, auditLog: parsed.auditLog || [], licenses: parsed.licenses || {}, hubtelStatus: parsed.hubtelStatus || {}, businessAuditLog: parsed.businessAuditLog || [] };
   } catch (e) {
     console.error('DB load error, starting with an empty store:', e.message);
-    return { cards: {}, packages: {}, auditLog: [], licenses: {} };
+    return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [] };
   }
 }
 
-let DB = { cards: {}, packages: {}, auditLog: [], licenses: {} }; // populated for real just before the server starts listening — see boot() below
+let DB = { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [] }; // populated for real just before the server starts listening — see boot() below
 let saveTimer = null;
 function saveDB() {
   clearTimeout(saveTimer);
@@ -214,7 +214,7 @@ function saveDB() {
       try {
         await mongoCollection.updateOne(
           { _id: 'db' },
-          { $set: { cards: DB.cards, packages: DB.packages, auditLog: DB.auditLog || [], licenses: DB.licenses || {}, updatedAt: new Date() } },
+          { $set: { cards: DB.cards, packages: DB.packages, auditLog: DB.auditLog || [], licenses: DB.licenses || {}, hubtelStatus: DB.hubtelStatus || {}, businessAuditLog: DB.businessAuditLog || [], updatedAt: new Date() } },
           { upsert: true }
         );
       } catch (e) {
@@ -768,6 +768,274 @@ app.get('/api/admin/overview', requireAdmin, (req, res) => {
     totalShares: cards.reduce((s, c) => s + (c.stats?.shares || 0), 0),
     packages: DB.packages
   });
+});
+
+// =====================================================================
+// AI BUSINESS PROPOSAL GENERATOR
+// Proxies to Anthropic's Messages API using a key that lives ONLY on
+// this server (ANTHROPIC_API_KEY env var) — never exposed to the
+// browser. This is why proposal generation goes through this backend
+// instead of calling Anthropic directly from BMS: a secret key must
+// never sit in client-side JS, and Anthropic's API isn't reachable
+// from a browser origin anyway (no CORS for direct browser calls).
+// =====================================================================
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
+const aiLimiter = makeRateLimiter({ windowMs: 60 * 1000, max: 8 }); // generation is relatively expensive — keep it tight
+app.use('/api/ai', aiLimiter);
+
+app.post('/api/ai/proposal', async (req, res) => {
+  if (!ANTHROPIC_API_KEY) {
+    return res.status(503).json({ ok: false, error: 'AI proposal generation is not configured on this server yet. The site owner needs to set the ANTHROPIC_API_KEY environment variable — see README-DEPLOY.md.' });
+  }
+  const {
+    companyName = '', clientName = '', projectTitle = '', industry = '',
+    scope = '', deliverables = '', budget = '', currency = 'GHS',
+    timeline = '', tone = 'professional', extraNotes = ''
+  } = req.body || {};
+
+  if (!clientName || !projectTitle || !scope) {
+    return res.status(400).json({ ok: false, error: 'clientName, projectTitle and scope are required.' });
+  }
+
+  const prompt = `You are a senior business consultant writing a polished, persuasive, client-ready business proposal for a services company. Write in a ${tone} tone.
+
+COMPANY SENDING THE PROPOSAL: ${companyName || 'Our company'}
+CLIENT / PROSPECT: ${clientName}
+INDUSTRY / CONTEXT: ${industry || 'not specified'}
+PROJECT TITLE: ${projectTitle}
+SCOPE OF WORK (as described by the sender): ${scope}
+KEY DELIVERABLES (if provided): ${deliverables || 'infer sensible deliverables from the scope'}
+BUDGET: ${budget ? `${currency} ${budget}` : 'not specified — do not invent a figure, describe pricing as "detailed in the attached quotation" instead'}
+TIMELINE: ${timeline || 'not specified — propose a reasonable phased timeline'}
+ADDITIONAL NOTES: ${extraNotes || 'none'}
+
+Structure the proposal with these sections, using clear markdown headings (##):
+1. Executive Summary
+2. Understanding Your Needs (show you understand the client's problem/goal)
+3. Proposed Solution / Scope of Work
+4. Deliverables
+5. Timeline (a simple phased breakdown)
+6. Investment (reference the budget only if one was given; otherwise say pricing is detailed separately)
+7. Why [Company Name] (2-3 concise, credible reasons — no invented statistics, awards, or client names)
+8. Next Steps (a clear call to action)
+
+Rules: Do not invent client testimonials, past client names, statistics, or certifications. Keep it concise, confident and specific to what was provided — expand professionally on the given scope rather than padding with generic filler. Output ONLY the proposal content in markdown, no preamble or meta-commentary.`;
+
+  try {
+    const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 2200,
+        messages: [{ role: 'user', content: prompt }]
+      })
+    });
+    if (!aiRes.ok) {
+      const errText = await aiRes.text().catch(() => '');
+      console.error('Anthropic API error:', aiRes.status, errText);
+      return res.status(502).json({ ok: false, error: 'The AI service returned an error. Please try again shortly.' });
+    }
+    const data = await aiRes.json();
+    const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
+    if (!text) return res.status(502).json({ ok: false, error: 'The AI service returned an empty response.' });
+    res.json({ ok: true, proposal: text });
+  } catch (e) {
+    console.error('AI proposal generation failed:', e.message);
+    res.status(500).json({ ok: false, error: 'Could not reach the AI service. Check the server has outbound internet access.' });
+  }
+});
+
+// =====================================================================
+// EMAIL SENDING (SMTP or SendGrid)
+// The tenant's own credentials are sent WITH each request (the same
+// trust model BMS already uses for the admin key) and are never
+// stored on this server — they live only in the tenant's own BMS
+// Settings (browser localStorage) and pass through per-request.
+// =====================================================================
+const emailLimiter = makeRateLimiter({ windowMs: 60 * 1000, max: 20 });
+app.use('/api/email', emailLimiter);
+
+app.post('/api/email/send', async (req, res) => {
+  const { provider, smtp, sendgridApiKey, from, fromName, to, subject, text, html } = req.body || {};
+  if (!to || !subject || !(text || html)) {
+    return res.status(400).json({ ok: false, error: 'to, subject and text/html are required.' });
+  }
+  try {
+    if (provider === 'sendgrid') {
+      if (!sendgridApiKey) return res.status(400).json({ ok: false, error: 'SendGrid API key missing. Add it in Settings → Notifications.' });
+      const sgRes = await fetch('https://api.sendgrid.com/v3/mail/send', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${sendgridApiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          personalizations: [{ to: [{ email: to }] }],
+          from: { email: from, name: fromName || undefined },
+          subject,
+          content: [{ type: html ? 'text/html' : 'text/plain', value: html || text }]
+        })
+      });
+      if (!sgRes.ok) {
+        const errText = await sgRes.text().catch(() => '');
+        console.error('SendGrid error:', sgRes.status, errText);
+        return res.status(502).json({ ok: false, error: 'SendGrid rejected the email — check the API key and verified sender address.' });
+      }
+      return res.json({ ok: true });
+    }
+
+    if (provider === 'smtp') {
+      if (!smtp || !smtp.host || !smtp.user || !smtp.pass) {
+        return res.status(400).json({ ok: false, error: 'SMTP host/user/pass missing. Add them in Settings → Notifications.' });
+      }
+      const nodemailer = require('nodemailer');
+      const transporter = nodemailer.createTransport({
+        host: smtp.host,
+        port: smtp.port || 587,
+        secure: !!smtp.secure,
+        auth: { user: smtp.user, pass: smtp.pass }
+      });
+      await transporter.sendMail({
+        from: fromName ? `"${fromName}" <${from || smtp.user}>` : (from || smtp.user),
+        to, subject, text, html
+      });
+      return res.json({ ok: true });
+    }
+
+    return res.status(400).json({ ok: false, error: 'Unknown email provider — expected "smtp" or "sendgrid".' });
+  } catch (e) {
+    console.error('Email send failed:', e.message);
+    res.status(500).json({ ok: false, error: 'Could not send the email: ' + e.message });
+  }
+});
+
+// =====================================================================
+// PAYMENT GATEWAYS — Paystack, Hubtel, ExpressPay (Ghana)
+// As with email, each tenant's own secret/API keys travel WITH the
+// request from their own BMS Settings and are never stored here.
+// These call the providers' real, documented REST APIs — a live
+// merchant account + keys from the provider are required to use them.
+// =====================================================================
+const payLimiter = makeRateLimiter({ windowMs: 60 * 1000, max: 30 });
+app.use('/api/payments', payLimiter);
+
+// ── Paystack ──
+app.post('/api/payments/paystack/initialize', async (req, res) => {
+  const { secretKey, email, amount, currency = 'GHS', reference, callbackUrl } = req.body || {};
+  if (!secretKey || !email || !amount || !reference) return res.status(400).json({ ok: false, error: 'secretKey, email, amount and reference are required.' });
+  try {
+    const r = await fetch('https://api.paystack.co/transaction/initialize', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${secretKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, amount: Math.round(amount * 100), currency, reference, callback_url: callbackUrl })
+    });
+    const data = await r.json();
+    if (!data.status) return res.status(502).json({ ok: false, error: data.message || 'Paystack rejected the request.' });
+    res.json({ ok: true, authorizationUrl: data.data.authorization_url, reference: data.data.reference });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+app.get('/api/payments/paystack/verify/:reference', async (req, res) => {
+  const secretKey = req.get('x-secret-key');
+  if (!secretKey) return res.status(400).json({ ok: false, error: 'x-secret-key header required.' });
+  try {
+    const r = await fetch(`https://api.paystack.co/transaction/verify/${encodeURIComponent(req.params.reference)}`, {
+      headers: { Authorization: `Bearer ${secretKey}` }
+    });
+    const data = await r.json();
+    if (!data.status) return res.status(502).json({ ok: false, error: data.message || 'Could not verify transaction.' });
+    res.json({ ok: true, status: data.data.status, amount: data.data.amount / 100, currency: data.data.currency, paidAt: data.data.paid_at });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── Hubtel Online Checkout ──
+app.post('/api/payments/hubtel/initiate', async (req, res) => {
+  const { clientId, clientSecret, merchantAccountNumber, amount, description, clientReference, callbackUrl, returnUrl, cancellationUrl } = req.body || {};
+  if (!clientId || !clientSecret || !merchantAccountNumber || !amount || !clientReference) {
+    return res.status(400).json({ ok: false, error: 'clientId, clientSecret, merchantAccountNumber, amount and clientReference are required.' });
+  }
+  try {
+    const auth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+    const r = await fetch('https://payproxyapi.hubtel.com/items/initiate', {
+      method: 'POST',
+      headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        totalAmount: amount,
+        description: description || 'Invoice payment',
+        callbackUrl, returnUrl, cancellationUrl,
+        merchantAccountNumber, clientReference
+      })
+    });
+    const data = await r.json();
+    if (!data.data || !data.data.checkoutUrl) return res.status(502).json({ ok: false, error: data.message || 'Hubtel rejected the request.' });
+    res.json({ ok: true, checkoutUrl: data.data.checkoutUrl, checkoutId: data.data.checkoutId });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+// Hubtel posts a server-to-server callback here once the customer completes
+// (or abandons) payment. We stash the last-known status per clientReference
+// so the BMS app can poll GET /status/:reference from the browser.
+app.post('/api/payments/hubtel/callback', (req, res) => {
+  const body = req.body || {};
+  const ref = body.ClientReference || body.clientReference || body.Data?.ClientReference;
+  if (ref) {
+    DB.hubtelStatus = DB.hubtelStatus || {};
+    DB.hubtelStatus[ref] = { ...body, receivedAt: new Date().toISOString() };
+    saveDB();
+  }
+  res.sendStatus(200);
+});
+app.get('/api/payments/hubtel/status/:reference', (req, res) => {
+  const rec = (DB.hubtelStatus || {})[req.params.reference];
+  res.json({ ok: true, found: !!rec, status: rec || null });
+});
+
+// ── ExpressPay Ghana (Dynamic Invoice API) ──
+app.post('/api/payments/expresspay/initiate', async (req, res) => {
+  const { merchantId, apiKey, amount, accountNumber, merchantReference, description, redirectUrl, postUrl, sandbox } = req.body || {};
+  if (!merchantId || !apiKey || !amount || !merchantReference) {
+    return res.status(400).json({ ok: false, error: 'merchantId, apiKey, amount and merchantReference are required.' });
+  }
+  try {
+    const base = sandbox ? 'https://sandbox.expresspaygh.com' : 'https://expresspaygh.com';
+    const params = new URLSearchParams({
+      'merchant-id': merchantId, 'api-key': apiKey, amount: String(amount),
+      accountnumber: accountNumber || '', 'merchant-reference': merchantReference,
+      description: description || 'Invoice payment',
+      'redirect-url': redirectUrl || '', 'post-url': postUrl || ''
+    });
+    const r = await fetch(`${base}/expresspay/api/dynamic-invoice.php`, {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: params
+    });
+    const data = await r.json();
+    if (data.status !== 1) return res.status(502).json({ ok: false, error: data.message || 'ExpressPay rejected the request.' });
+    res.json({ ok: true, checkoutUrl: data.url });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// =====================================================================
+// GENERAL BUSINESS AUDIT LOG
+// Best-effort trail of significant actions taken inside the main BMS
+// app (client created, invoice paid, payroll run, settings changed…).
+// The app posts events here opportunistically when online; nothing
+// blocks on it, and the full authoritative log always also lives in
+// the tenant's own browser (Settings → Security → Audit Log) since
+// this app is designed to keep working fully offline.
+// =====================================================================
+app.post('/api/audit', (req, res) => {
+  const { licenseKey, actor, action, details } = req.body || {};
+  if (!licenseKey || !action) return res.status(400).json({ ok: false, error: 'licenseKey and action are required.' });
+  DB.businessAuditLog = DB.businessAuditLog || [];
+  DB.businessAuditLog.unshift({ at: new Date().toISOString(), licenseKey, actor: actor || 'unknown', action, details: details || null });
+  DB.businessAuditLog = DB.businessAuditLog.slice(0, 5000);
+  saveDB();
+  res.json({ ok: true });
+});
+app.get('/api/admin/business-audit-log', requireAdmin, (req, res) => {
+  const { licenseKey } = req.query;
+  let log = DB.businessAuditLog || [];
+  if (licenseKey) log = log.filter(l => l.licenseKey === licenseKey);
+  res.json({ ok: true, auditLog: log.slice(0, 500) });
 });
 
 app.use((req, res) => res.status(404).send(notFoundPage()));

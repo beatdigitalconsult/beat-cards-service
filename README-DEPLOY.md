@@ -5,24 +5,52 @@
 
 WHAT THIS IS
 ------------------------------------------------------------
-A small, always-online web service with one job: give every
-Digital Business Card a permanent public link, and show a full
-profile page (contact details, Save Contact, Call, Email,
-WhatsApp) whenever that link — or the card's QR code — is
-opened. It also lets the Beat Digital Consult owner approve or
-revoke the Digital Business Card add-on for a specific client,
-from anywhere.
+A small, always-online web service that backs the parts of BMS
+that genuinely need a server: permanent public links for Digital
+Business Cards (with a full profile page — contact details, Save
+Contact, Call, Email, WhatsApp), owner approval/revocation of the
+card add-on, the AI Business Proposal generator, real email
+sending (SMTP/SendGrid), and real payment gateway checkout
+(Paystack, Hubtel, ExpressPay).
 
 This piece MUST be deployed online (it is the "hosted" part of
 BMS). Everything else in the BMS desktop app keeps working fully
-offline exactly as before — only the card profile pages and the
-package approval check need this service and an internet
-connection.
+offline exactly as before — only these connected features need
+this service and an internet connection; if it's unreachable,
+BMS quietly falls back to manual mailto:/WhatsApp links and those
+few features are simply unavailable until it's back.
 
 I (Claude) wrote and tested this code, but I can't click
 "Deploy" for you — I don't have the ability to reach the
 internet or create accounts on your behalf. The steps below are
 the whole job, and they take about 10 minutes the first time.
+
+ENVIRONMENT VARIABLES
+------------------------------------------------------------
+  ADMIN_KEY           (required) — protects the card-approval
+                       and audit-log admin endpoints. Generate
+                       with:
+                       node -e "console.log(require('crypto').randomBytes(24).toString('hex'))"
+
+  ANTHROPIC_API_KEY   (optional) — only needed for the AI
+                       Business Proposal generator (Proposals
+                       page). Get one at https://console.anthropic.com
+                       Without it, Proposals shows a clear
+                       "not configured yet" message instead of a
+                       generic error.
+
+  MONGODB_URI         (optional but recommended) — persists cards,
+                       licenses, and the audit/business-audit log
+                       across restarts. Without it, data lives in
+                       a local JSON file that resets if the host
+                       wipes the filesystem (e.g. Render free tier
+                       redeploys).
+
+  Note: SMTP/SendGrid credentials and Paystack/Hubtel/ExpressPay
+  keys are NOT server environment variables — each business
+  enters their own in BMS Settings, and those travel with each
+  request rather than being stored on this server. Nothing to
+  configure here for those.
 
 ------------------------------------------------------------
 OPTION A — DEPLOY ON RENDER.COM (recommended, has a free tier)
