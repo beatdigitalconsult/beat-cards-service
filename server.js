@@ -17,6 +17,8 @@
 // card package is currently active.
 // =====================================================================
 
+const http = require('http');
+const { Server: SocketIOServer } = require('socket.io');
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
@@ -180,24 +182,24 @@ async function loadDB() {
   if (mongoCollection) {
     try {
       const doc = await mongoCollection.findOne({ _id: 'db' });
-      if (doc) return { cards: doc.cards || {}, packages: doc.packages || {}, auditLog: doc.auditLog || [], licenses: doc.licenses || {}, hubtelStatus: doc.hubtelStatus || {}, businessAuditLog: doc.businessAuditLog || [], portals: doc.portals || {}, surveys: doc.surveys || {}, surveyResponses: doc.surveyResponses || {} };
-      return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {} };
+      if (doc) return { cards: doc.cards || {}, packages: doc.packages || {}, auditLog: doc.auditLog || [], licenses: doc.licenses || {}, hubtelStatus: doc.hubtelStatus || {}, businessAuditLog: doc.businessAuditLog || [], portals: doc.portals || {}, surveys: doc.surveys || {}, surveyResponses: doc.surveyResponses || {}, teamChat: doc.teamChat || {}, recordComments: doc.recordComments || {} };
+      return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {} };
     } catch (e) {
       console.error('MongoDB load error, falling back to local file for this boot:', e.message);
     }
   }
   try {
-    if (!fs.existsSync(DB_PATH)) return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {} };
+    if (!fs.existsSync(DB_PATH)) return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {} };
     const raw = fs.readFileSync(DB_PATH, 'utf8');
     const parsed = JSON.parse(raw || '{}');
-    return { cards: parsed.cards || {}, packages: parsed.packages || {}, auditLog: parsed.auditLog || [], licenses: parsed.licenses || {}, hubtelStatus: parsed.hubtelStatus || {}, businessAuditLog: parsed.businessAuditLog || [], portals: parsed.portals || {}, surveys: parsed.surveys || {}, surveyResponses: parsed.surveyResponses || {} };
+    return { cards: parsed.cards || {}, packages: parsed.packages || {}, auditLog: parsed.auditLog || [], licenses: parsed.licenses || {}, hubtelStatus: parsed.hubtelStatus || {}, businessAuditLog: parsed.businessAuditLog || [], portals: parsed.portals || {}, surveys: parsed.surveys || {}, surveyResponses: parsed.surveyResponses || {}, teamChat: parsed.teamChat || {}, recordComments: parsed.recordComments || {} };
   } catch (e) {
     console.error('DB load error, starting with an empty store:', e.message);
-    return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {} };
+    return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {} };
   }
 }
 
-let DB = { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {} }; // populated for real just before the server starts listening — see boot() below
+let DB = { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {} }; // populated for real just before the server starts listening — see boot() below
 let saveTimer = null;
 function saveDB() {
   clearTimeout(saveTimer);
@@ -214,7 +216,7 @@ function saveDB() {
       try {
         await mongoCollection.updateOne(
           { _id: 'db' },
-          { $set: { cards: DB.cards, packages: DB.packages, auditLog: DB.auditLog || [], licenses: DB.licenses || {}, hubtelStatus: DB.hubtelStatus || {}, businessAuditLog: DB.businessAuditLog || [], portals: DB.portals || {}, surveys: DB.surveys || {}, surveyResponses: DB.surveyResponses || {}, updatedAt: new Date() } },
+          { $set: { cards: DB.cards, packages: DB.packages, auditLog: DB.auditLog || [], licenses: DB.licenses || {}, hubtelStatus: DB.hubtelStatus || {}, businessAuditLog: DB.businessAuditLog || [], portals: DB.portals || {}, surveys: DB.surveys || {}, surveyResponses: DB.surveyResponses || {}, teamChat: DB.teamChat || {}, recordComments: DB.recordComments || {}, updatedAt: new Date() } },
           { upsert: true }
         );
       } catch (e) {
@@ -1219,6 +1221,100 @@ app.get('/api/public/v1/:resource', (req, res) => {
   res.json({ ok: true, resource, syncedAt: entry.syncedAt, data });
 });
 
+// =====================================================================
+// REAL-TIME COLLABORATION — presence, live "who's viewing what",
+// soft record-locking, team chat, and per-record comments.
+// Everything here is scoped to a Socket.IO "room" per license key, so
+// staff only ever see presence/chat/comments from their OWN business
+// — never across tenants. Chat and comments are also persisted to DB
+// (same store as everything else) and exposed via plain REST GET
+// endpoints below, so a client that's offline or hasn't loaded
+// Socket.IO yet still gets the latest data on reconnect — consistent
+// with the rest of BMS being offline-first.
+// =====================================================================
+const presenceByRoom = {}; // { [licenseKey]: { [socketId]: {name, email, page, since} } }
+
+function attachCollaboration(httpServer) {
+  const io = new SocketIOServer(httpServer, { cors: { origin: '*' } });
+
+  io.on('connection', (socket) => {
+    let room = null, identity = null;
+
+    socket.on('collab:join', (payload) => {
+      const licenseKey = (payload && payload.licenseKey) || null;
+      if (!licenseKey) return;
+      room = licenseKey;
+      identity = { name: (payload.name || 'Staff').slice(0, 60), email: (payload.email || '').slice(0, 100), page: payload.page || null, since: Date.now() };
+      socket.join(room);
+      presenceByRoom[room] = presenceByRoom[room] || {};
+      presenceByRoom[room][socket.id] = identity;
+      socket.emit('collab:presence', Object.values(presenceByRoom[room]));
+      socket.to(room).emit('collab:presence', Object.values(presenceByRoom[room]));
+    });
+
+    socket.on('collab:page', (payload) => {
+      if (!room || !presenceByRoom[room]?.[socket.id]) return;
+      presenceByRoom[room][socket.id].page = payload?.page || null;
+      presenceByRoom[room][socket.id].recordId = payload?.recordId || null;
+      io.to(room).emit('collab:presence', Object.values(presenceByRoom[room]));
+    });
+
+    // Soft edit-lock: just tells other viewers "someone's already
+    // editing this" — never blocks the action. Matches the offline-
+    // first design: a hard lock would break single-device offline use.
+    socket.on('collab:editing', (payload) => {
+      if (!room) return;
+      socket.to(room).emit('collab:editing', { ...payload, by: identity?.name || 'Someone', socketId: socket.id });
+    });
+    socket.on('collab:doneEditing', (payload) => {
+      if (!room) return;
+      socket.to(room).emit('collab:doneEditing', { ...payload, socketId: socket.id });
+    });
+
+    socket.on('collab:chatSend', (payload) => {
+      if (!room || !payload?.text) return;
+      const msg = { id: newId(), room, author: identity?.name || 'Staff', authorEmail: identity?.email || '', text: String(payload.text).slice(0, 2000), at: new Date().toISOString() };
+      DB.teamChat[room] = DB.teamChat[room] || [];
+      DB.teamChat[room].push(msg);
+      DB.teamChat[room] = DB.teamChat[room].slice(-500); // cap history per tenant
+      saveDB();
+      io.to(room).emit('collab:chatMessage', msg);
+    });
+
+    socket.on('collab:commentAdd', (payload) => {
+      if (!room || !payload?.recordType || !payload?.recordId || !payload?.text) return;
+      const key = `${payload.recordType}:${payload.recordId}`;
+      const comment = { id: newId(), author: identity?.name || 'Staff', authorEmail: identity?.email || '', text: String(payload.text).slice(0, 2000), at: new Date().toISOString() };
+      DB.recordComments[room] = DB.recordComments[room] || {};
+      DB.recordComments[room][key] = DB.recordComments[room][key] || [];
+      DB.recordComments[room][key].push(comment);
+      saveDB();
+      io.to(room).emit('collab:commentAdded', { recordType: payload.recordType, recordId: payload.recordId, comment });
+    });
+
+    socket.on('disconnect', () => {
+      if (room && presenceByRoom[room]) {
+        delete presenceByRoom[room][socket.id];
+        io.to(room).emit('collab:presence', Object.values(presenceByRoom[room]));
+        socket.to(room).emit('collab:editing', { cleared: true, socketId: socket.id });
+      }
+    });
+  });
+
+  return io;
+}
+
+// REST fallbacks (offline/reconnect catch-up — no socket required)
+app.get('/api/collab/:licenseKey/chat', (req, res) => {
+  const messages = (DB.teamChat[req.params.licenseKey] || []).slice(-200);
+  res.json({ ok: true, messages });
+});
+app.get('/api/collab/:licenseKey/comments/:recordType/:recordId', (req, res) => {
+  const key = `${req.params.recordType}:${req.params.recordId}`;
+  const comments = DB.recordComments[req.params.licenseKey]?.[key] || [];
+  res.json({ ok: true, comments });
+});
+
 app.use((req, res) => res.status(404).send(notFoundPage()));
 
 // ---------------------------------------------------------------
@@ -1229,11 +1325,14 @@ app.use((req, res) => res.status(404).send(notFoundPage()));
 async function boot() {
   await initMongo();
   DB = await loadDB();
-  app.listen(PORT, () => {
+  const httpServer = http.createServer(app);
+  attachCollaboration(httpServer); // real-time presence, comments, team chat — see below
+  httpServer.listen(PORT, () => {
     console.log(`\n🪪 ${BRAND.product} — Card Profile Service`);
     console.log(`   by ${BRAND.company} — running on port ${PORT}`);
     console.log(`   Storage: ${mongoCollection ? 'MongoDB (persistent ✅)' : 'local file only (NOT persistent on Render free tier ⚠️)'}`);
     console.log(`   Cards loaded: ${Object.keys(DB.cards).length}`);
+    console.log(`   Realtime: Socket.IO attached (presence, chat, comments)`);
     console.log(`   Health check: /healthz\n`);
   });
 }
