@@ -180,24 +180,24 @@ async function loadDB() {
   if (mongoCollection) {
     try {
       const doc = await mongoCollection.findOne({ _id: 'db' });
-      if (doc) return { cards: doc.cards || {}, packages: doc.packages || {}, auditLog: doc.auditLog || [], licenses: doc.licenses || {}, hubtelStatus: doc.hubtelStatus || {}, businessAuditLog: doc.businessAuditLog || [] };
-      return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [] };
+      if (doc) return { cards: doc.cards || {}, packages: doc.packages || {}, auditLog: doc.auditLog || [], licenses: doc.licenses || {}, hubtelStatus: doc.hubtelStatus || {}, businessAuditLog: doc.businessAuditLog || [], portals: doc.portals || {}, surveys: doc.surveys || {}, surveyResponses: doc.surveyResponses || {} };
+      return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {} };
     } catch (e) {
       console.error('MongoDB load error, falling back to local file for this boot:', e.message);
     }
   }
   try {
-    if (!fs.existsSync(DB_PATH)) return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [] };
+    if (!fs.existsSync(DB_PATH)) return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {} };
     const raw = fs.readFileSync(DB_PATH, 'utf8');
     const parsed = JSON.parse(raw || '{}');
-    return { cards: parsed.cards || {}, packages: parsed.packages || {}, auditLog: parsed.auditLog || [], licenses: parsed.licenses || {}, hubtelStatus: parsed.hubtelStatus || {}, businessAuditLog: parsed.businessAuditLog || [] };
+    return { cards: parsed.cards || {}, packages: parsed.packages || {}, auditLog: parsed.auditLog || [], licenses: parsed.licenses || {}, hubtelStatus: parsed.hubtelStatus || {}, businessAuditLog: parsed.businessAuditLog || [], portals: parsed.portals || {}, surveys: parsed.surveys || {}, surveyResponses: parsed.surveyResponses || {} };
   } catch (e) {
     console.error('DB load error, starting with an empty store:', e.message);
-    return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [] };
+    return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {} };
   }
 }
 
-let DB = { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [] }; // populated for real just before the server starts listening — see boot() below
+let DB = { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {} }; // populated for real just before the server starts listening — see boot() below
 let saveTimer = null;
 function saveDB() {
   clearTimeout(saveTimer);
@@ -214,7 +214,7 @@ function saveDB() {
       try {
         await mongoCollection.updateOne(
           { _id: 'db' },
-          { $set: { cards: DB.cards, packages: DB.packages, auditLog: DB.auditLog || [], licenses: DB.licenses || {}, hubtelStatus: DB.hubtelStatus || {}, businessAuditLog: DB.businessAuditLog || [], updatedAt: new Date() } },
+          { $set: { cards: DB.cards, packages: DB.packages, auditLog: DB.auditLog || [], licenses: DB.licenses || {}, hubtelStatus: DB.hubtelStatus || {}, businessAuditLog: DB.businessAuditLog || [], portals: DB.portals || {}, surveys: DB.surveys || {}, surveyResponses: DB.surveyResponses || {}, updatedAt: new Date() } },
           { upsert: true }
         );
       } catch (e) {
@@ -1036,6 +1036,187 @@ app.get('/api/admin/business-audit-log', requireAdmin, (req, res) => {
   let log = DB.businessAuditLog || [];
   if (licenseKey) log = log.filter(l => l.licenseKey === licenseKey);
   res.json({ ok: true, auditLog: log.slice(0, 500) });
+});
+
+// =====================================================================
+// CUSTOMER SELF-SERVICE PORTAL — a tenant publishes a read-only snapshot
+// of one invoice (never the whole dataset) for their client to view and
+// pay online. Same trust model as Digital Business Cards: license key
+// owns what it publishes, nothing else is ever exposed.
+// =====================================================================
+app.post('/api/portal/publish', (req, res) => {
+  const licenseKey = req.get('x-license-key') || 'UNKNOWN';
+  const snapshot = req.body || {};
+  if (!snapshot.invoiceId || !snapshot.total) return res.status(400).json({ ok: false, error: 'invoiceId and total are required.' });
+  const id = snapshot.publicId && DB.portals[snapshot.publicId]?.licenseKey === licenseKey ? snapshot.publicId : newId();
+  DB.portals[id] = { ...snapshot, licenseKey, publishedAt: new Date().toISOString() };
+  saveDB();
+  const base = `${req.protocol}://${req.get('host')}`;
+  res.json({ ok: true, id, url: `${base}/portal/${id}` });
+});
+app.get('/portal/:id', (req, res) => {
+  const p = DB.portals[req.params.id];
+  if (!p) return res.status(404).send(notFoundPage());
+  const paidBadge = p.status === 'paid' ? '<span style="background:#16a34a;color:#fff;padding:4px 12px;border-radius:20px;font-size:13px">✅ Paid</span>'
+    : `<span style="background:#f59e0b;color:#fff;padding:4px 12px;border-radius:20px;font-size:13px">⏳ ${p.status||'Awaiting Payment'}</span>`;
+  const itemsHtml = (p.items || []).map(it => `<tr><td style="padding:8px 0;border-bottom:1px solid #eee">${it.desc||it.description||''}</td><td style="padding:8px 0;border-bottom:1px solid #eee;text-align:right">${p.currencySymbol||'₵'}${(it.total||it.amount||0).toLocaleString()}</td></tr>`).join('');
+  const payButtons = (p.balance > 0 && p.paystackPublicKey) ? `
+    <button onclick="payWithPaystack()" style="background:#0ea5e9;color:#fff;border:none;padding:12px 24px;border-radius:8px;font-size:15px;cursor:pointer;margin-top:16px">💳 Pay Now — ${p.currencySymbol||'₵'}${p.balance.toLocaleString()}</button>
+    <script src="https://js.paystack.co/v1/inline.js"></script>
+    <script>
+      function payWithPaystack(){
+        const handler = PaystackPop.setup({
+          key: '${p.paystackPublicKey}', email: '${(p.clientEmail||'customer@example.com').replace(/'/g,"")}',
+          amount: ${Math.round((p.balance||0)*100)}, currency: '${p.currency||'GHS'}',
+          ref: 'PORTAL-${p.invoiceId}-'+Date.now(),
+          callback: function(r){ fetch('/api/payments/paystack/verify/'+r.reference).then(x=>x.json()).then(()=>{ alert('Payment received — thank you!'); location.reload(); }); },
+          onClose: function(){}
+        });
+        handler.openIframe();
+      }
+    </script>` : '';
+  res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Invoice ${p.invoiceId} — ${p.businessName||''}</title>
+    <style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#f8fafc;margin:0;padding:24px}
+    .card{max-width:560px;margin:0 auto;background:#fff;border-radius:14px;padding:28px;box-shadow:0 4px 20px rgba(0,0,0,.06)}
+    h1{font-size:20px;margin:0 0 4px}.muted{color:#64748b;font-size:13px}table{width:100%;border-collapse:collapse;margin-top:16px}</style></head>
+    <body><div class="card">
+      <h1>${p.businessName||'Invoice'}</h1><div class="muted">Invoice ${p.invoiceId} · ${p.clientName||''}</div>
+      <div style="margin-top:12px">${paidBadge}</div>
+      <table>${itemsHtml}<tr><td style="padding-top:12px;font-weight:700">Total</td><td style="padding-top:12px;font-weight:700;text-align:right">${p.currencySymbol||'₵'}${(p.total||0).toLocaleString()}</td></tr></table>
+      ${payButtons}
+      <div class="muted" style="margin-top:20px">Powered by BMS — Beat Digital Consult</div>
+    </div></body></html>`);
+});
+
+// =====================================================================
+// NPS / SATISFACTION SURVEYS — publish a question, collect anonymous
+// (or client-named) responses on a public page, tenant pulls them back
+// into their own local BMS via the sync endpoint below.
+// =====================================================================
+app.post('/api/survey/publish', (req, res) => {
+  const licenseKey = req.get('x-license-key') || 'UNKNOWN';
+  const { id, title, question } = req.body || {};
+  if (!id || !question) return res.status(400).json({ ok: false, error: 'id and question are required.' });
+  DB.surveys[id] = { id, title, question, licenseKey, publishedAt: new Date().toISOString() };
+  saveDB();
+  const base = `${req.protocol}://${req.get('host')}`;
+  res.json({ ok: true, url: `${base}/survey/${id}` });
+});
+app.get('/survey/:id', (req, res) => {
+  const s = DB.surveys[req.params.id];
+  if (!s) return res.status(404).send(notFoundPage());
+  const clientName = (req.query.client || '').toString().slice(0, 100);
+  res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>${s.title||'Quick Survey'}</title>
+    <style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#f8fafc;margin:0;padding:24px}
+    .card{max-width:520px;margin:0 auto;background:#fff;border-radius:14px;padding:28px;box-shadow:0 4px 20px rgba(0,0,0,.06)}
+    .scale{display:flex;gap:6px;flex-wrap:wrap;margin:16px 0}.scale button{width:38px;height:38px;border-radius:8px;border:1px solid #e2e8f0;background:#fff;cursor:pointer;font-weight:600}
+    .scale button.sel{background:#0ea5e9;color:#fff;border-color:#0ea5e9}
+    textarea{width:100%;border:1px solid #e2e8f0;border-radius:8px;padding:10px;font-family:inherit;margin-top:10px}
+    button.submit{background:#16a34a;color:#fff;border:none;padding:12px 24px;border-radius:8px;font-size:15px;cursor:pointer;margin-top:14px}</style></head>
+    <body><div class="card">
+      <h2>${s.title||'Quick Survey'}</h2><p>${s.question}</p>
+      <div class="scale" id="scale">${Array.from({length:11},(_,i)=>`<button onclick="pick(${i})" data-v="${i}">${i}</button>`).join('')}</div>
+      <textarea id="comment" placeholder="Anything you'd like to add? (optional)" rows="3"></textarea>
+      <div><button class="submit" onclick="submitResponse()">Submit</button></div>
+      <div id="thanks" style="display:none;margin-top:14px;color:#16a34a;font-weight:600">Thank you for your feedback! 🙏</div>
+    </div>
+    <script>
+      let rating = null;
+      function pick(v){ rating=v; document.querySelectorAll('#scale button').forEach(b=>b.classList.toggle('sel', +b.dataset.v===v)); }
+      function submitResponse(){
+        if (rating===null) return alert('Please select a rating from 0-10');
+        fetch('/api/survey/${req.params.id}/respond', { method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ clientName: '${clientName.replace(/'/g,"")}', rating, comment: document.getElementById('comment').value })
+        }).then(()=>{ document.querySelector('.card').innerHTML=''; document.getElementById('thanks').style.display='block'; document.querySelector('.card').appendChild(document.getElementById('thanks')); });
+      }
+    </script>
+    </body></html>`);
+});
+app.post('/api/survey/:id/respond', (req, res) => {
+  const s = DB.surveys[req.params.id];
+  if (!s) return res.status(404).json({ ok: false });
+  const { clientName, rating, comment } = req.body || {};
+  DB.surveyResponses[req.params.id] = DB.surveyResponses[req.params.id] || [];
+  DB.surveyResponses[req.params.id].push({ id: newId(), clientName: (clientName||'').slice(0,100), rating: parseInt(rating), comment: (comment||'').slice(0,1000), at: new Date().toISOString() });
+  saveDB();
+  res.json({ ok: true });
+});
+// Tenant's own BMS polls this (with its license key) to pull responses
+// back into local storage — never the other way around, so the tenant
+// always keeps their own copy of the data.
+app.get('/api/survey/:id/responses', (req, res) => {
+  const licenseKey = req.get('x-license-key') || 'UNKNOWN';
+  const s = DB.surveys[req.params.id];
+  if (!s || s.licenseKey !== licenseKey) return res.status(403).json({ ok: false, error: 'Not your survey.' });
+  res.json({ ok: true, responses: DB.surveyResponses[req.params.id] || [] });
+});
+
+// =====================================================================
+// SMS SENDING — mNotify (Ghana) or Hubtel SMS, same "bring your own
+// credentials" model as email: nothing is stored server-side, keys
+// travel with each request from the tenant's own Settings.
+// =====================================================================
+app.post('/api/sms/send', async (req, res) => {
+  const { provider, apiKey, senderId, clientId, clientSecret, to, message } = req.body || {};
+  if (!provider || provider === 'none') return res.status(400).json({ ok: false, error: 'No SMS provider configured.' });
+  if (!to || !message) return res.status(400).json({ ok: false, error: 'to and message are required.' });
+  try {
+    if (provider === 'mnotify') {
+      const url = `https://api.mnotify.com/api/sms/quick?key=${encodeURIComponent(apiKey)}`;
+      const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ recipient: [to], sender: senderId || 'BMS', message, is_schedule: false }) });
+      const data = await r.json().catch(()=>({}));
+      if (!r.ok) return res.status(502).json({ ok: false, error: data.message || 'mNotify send failed.' });
+      return res.json({ ok: true, provider: 'mnotify', response: data });
+    }
+    if (provider === 'hubtel') {
+      const url = `https://smsc.hubtel.com/v1/messages/send?clientid=${encodeURIComponent(clientId)}&clientsecret=${encodeURIComponent(clientSecret)}&from=${encodeURIComponent(senderId||'BMS')}&to=${encodeURIComponent(to)}&content=${encodeURIComponent(message)}`;
+      const r = await fetch(url);
+      const data = await r.json().catch(()=>({}));
+      if (!r.ok) return res.status(502).json({ ok: false, error: 'Hubtel SMS send failed.' });
+      return res.json({ ok: true, provider: 'hubtel', response: data });
+    }
+    return res.status(400).json({ ok: false, error: 'Unknown SMS provider.' });
+  } catch (e) {
+    return res.status(502).json({ ok: false, error: e.message });
+  }
+});
+
+// =====================================================================
+// PUBLIC REST API — read-only, per-license-key access to a tenant's
+// OWN business-data snapshot, for Zapier/Make/custom integrations.
+// Requires the tenant to have opted in from Settings → Public API
+// (which is what pushes a snapshot here in the first place — nothing
+// is exposed unless the tenant explicitly publishes it).
+// =====================================================================
+app.post('/api/public/sync', (req, res) => {
+  const licenseKey = req.get('x-license-key') || 'UNKNOWN';
+  const apiKey = req.get('x-api-key');
+  const snapshot = req.body || {};
+  DB.publicApiData = DB.publicApiData || {};
+  const existing = DB.publicApiData[licenseKey];
+  // First sync establishes the API key for this license; subsequent
+  // syncs must present the same key, so nobody else can push data
+  // under someone else's license.
+  if (existing && existing.apiKey && existing.apiKey !== apiKey) {
+    return res.status(403).json({ ok: false, error: 'Invalid API key for this license.' });
+  }
+  DB.publicApiData[licenseKey] = { apiKey: apiKey || existing?.apiKey, data: snapshot, syncedAt: new Date().toISOString() };
+  saveDB();
+  res.json({ ok: true, syncedAt: DB.publicApiData[licenseKey].syncedAt });
+});
+app.get('/api/public/v1/:resource', (req, res) => {
+  const apiKey = req.get('x-api-key');
+  if (!apiKey) return res.status(401).json({ ok: false, error: 'x-api-key header required.' });
+  DB.publicApiData = DB.publicApiData || {};
+  const entry = Object.values(DB.publicApiData).find(e => e.apiKey === apiKey);
+  if (!entry) return res.status(401).json({ ok: false, error: 'Invalid API key.' });
+  const resource = req.params.resource;
+  const data = entry.data?.[resource];
+  if (data === undefined) return res.status(404).json({ ok: false, error: `Unknown or unpublished resource: ${resource}. Available: ${Object.keys(entry.data||{}).join(', ')}` });
+  res.json({ ok: true, resource, syncedAt: entry.syncedAt, data });
 });
 
 app.use((req, res) => res.status(404).send(notFoundPage()));
