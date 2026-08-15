@@ -1242,7 +1242,31 @@ function attachCollaboration(httpServer) {
 
     socket.on('collab:join', (payload) => {
       const licenseKey = (payload && payload.licenseKey) || null;
-      if (!licenseKey) return;
+      const deviceId = (payload && payload.deviceId) || null;
+      if (!licenseKey || !deviceId) {
+        socket.emit('collab:joinError', { error: 'Missing license key or device ID.' });
+        return;
+      }
+      // AUTHENTICATION: a bare license key is not a secret — it can
+      // appear in onboarding emails, screenshots, etc. — so it alone
+      // must never be enough to join a tenant's live chat/comments/
+      // presence. Require the license to be genuinely active AND the
+      // connecting device to already be a checked-in activation on
+      // that license (the same activations list /api/license/:key/
+      // checkin maintains), so joining a room proves "this is a
+      // device the license owner actually activated," not just
+      // "this client typed a key it found somewhere."
+      const lic = DB.licenses[licenseKey];
+      const status = licenseStatusOf(lic);
+      if (status !== 'active') {
+        socket.emit('collab:joinError', { error: 'License is not active — cannot join team chat.' });
+        return;
+      }
+      const knownDevice = (lic.activations || []).some(a => a.deviceId === deviceId);
+      if (!knownDevice) {
+        socket.emit('collab:joinError', { error: 'This device is not an activated seat on this license — cannot join team chat.' });
+        return;
+      }
       room = licenseKey;
       identity = { name: (payload.name || 'Staff').slice(0, 60), email: (payload.email || '').slice(0, 100), page: payload.page || null, since: Date.now() };
       socket.join(room);
@@ -1304,14 +1328,34 @@ function attachCollaboration(httpServer) {
   return io;
 }
 
-// REST fallbacks (offline/reconnect catch-up — no socket required)
+// REST fallbacks (offline/reconnect catch-up — no socket required).
+// Same authentication requirement as the socket join: the license
+// must be active AND the requesting device must already be a known
+// activation on it. Sent as headers (x-license-key / x-device-id)
+// since these are simple GETs, not the POST-with-body pattern used
+// elsewhere.
+function requireActivatedDevice(req, res) {
+  const licenseKey = req.params.licenseKey || req.get('x-license-key');
+  const deviceId = req.get('x-device-id');
+  if (!licenseKey || !deviceId) { res.status(401).json({ ok: false, error: 'Missing license key or device ID.' }); return null; }
+  const lic = DB.licenses[licenseKey];
+  const status = licenseStatusOf(lic);
+  if (status !== 'active') { res.status(403).json({ ok: false, error: 'License is not active.' }); return null; }
+  const knownDevice = (lic.activations || []).some(a => a.deviceId === deviceId);
+  if (!knownDevice) { res.status(403).json({ ok: false, error: 'This device is not an activated seat on this license.' }); return null; }
+  return licenseKey;
+}
 app.get('/api/collab/:licenseKey/chat', (req, res) => {
-  const messages = (DB.teamChat[req.params.licenseKey] || []).slice(-200);
+  const licenseKey = requireActivatedDevice(req, res);
+  if (!licenseKey) return;
+  const messages = (DB.teamChat[licenseKey] || []).slice(-200);
   res.json({ ok: true, messages });
 });
 app.get('/api/collab/:licenseKey/comments/:recordType/:recordId', (req, res) => {
+  const licenseKey = requireActivatedDevice(req, res);
+  if (!licenseKey) return;
   const key = `${req.params.recordType}:${req.params.recordId}`;
-  const comments = DB.recordComments[req.params.licenseKey]?.[key] || [];
+  const comments = DB.recordComments[licenseKey]?.[key] || [];
   res.json({ ok: true, comments });
 });
 
