@@ -570,7 +570,11 @@ const PLAN_CODES = { S: 'starter', P: 'professional', E: 'enterprise', L: 'lifet
 
 function parseLicenseKey(key) {
   const parts = (key || '').trim().toUpperCase().split('-');
-  if (parts.length !== 6 || parts[0] !== 'BDC') return null;
+  // BDC-{plan}-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX = 8 parts.
+  // Kept in lockstep with License.generateKey/validateKey/activateKey
+  // in beat-bms/js/auth.js — all three must agree on the key shape,
+  // or activation succeeds on one side and fails on the other.
+  if (parts.length !== 8 || parts[0] !== 'BDC') return null;
   const plan = PLAN_CODES[parts[1]];
   if (!plan) return null;
   return { key: parts.join('-'), plan };
