@@ -1,6 +1,6 @@
 {
   "name": "beat-cards-hosting-service",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "description": "Beat Management System (by Beat Digital Consult) — hosted companion service for Digital Business Cards, AI proposal generation, email sending, real-time collaboration, and Ghana payment gateway integrations (Paystack, Hubtel, ExpressPay).",
   "main": "server.js",
   "engines": {
