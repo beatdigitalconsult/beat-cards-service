@@ -1287,12 +1287,14 @@ function attachCollaboration(httpServer) {
       // "this client typed a key it found somewhere."
       const lic = DB.licenses[licenseKey];
       const status = licenseStatusOf(lic);
-      if (status !== 'active') {
+      const adminKey = payload.adminKey || socket.handshake.auth?.adminKey || '';
+      const isOwnerSession = licenseKey === OWNER_LICENSE_KEY && adminKey === ADMIN_KEY;
+      if (!isOwnerSession && status !== 'active') {
         socket.emit('collab:joinError', { error: 'License is not active — cannot join team chat.' });
         return;
       }
-      const knownDevice = (lic.activations || []).some(a => a.deviceId === deviceId);
-      if (!knownDevice) {
+      const knownDevice = (lic?.activations || []).some(a => a.deviceId === deviceId);
+      if (!isOwnerSession && !knownDevice) {
         socket.emit('collab:joinError', { error: 'This device is not an activated seat on this license — cannot join team chat.' });
         return;
       }
@@ -1366,6 +1368,8 @@ function attachCollaboration(httpServer) {
 function requireActivatedDevice(req, res) {
   const licenseKey = req.params.licenseKey || req.get('x-license-key');
   const deviceId = req.get('x-device-id');
+  const isOwnerSession = licenseKey === OWNER_LICENSE_KEY && req.get('x-admin-key') === ADMIN_KEY;
+  if (isOwnerSession) return licenseKey;
   if (!licenseKey || !deviceId) { res.status(401).json({ ok: false, error: 'Missing license key or device ID.' }); return null; }
   const lic = DB.licenses[licenseKey];
   const status = licenseStatusOf(lic);
