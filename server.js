@@ -182,8 +182,8 @@ async function loadDB() {
   if (mongoCollection) {
     try {
       const doc = await mongoCollection.findOne({ _id: 'db' });
-      if (doc) return { cards: doc.cards || {}, packages: doc.packages || {}, auditLog: doc.auditLog || [], licenses: doc.licenses || {}, hubtelStatus: doc.hubtelStatus || {}, businessAuditLog: doc.businessAuditLog || [], portals: doc.portals || {}, surveys: doc.surveys || {}, surveyResponses: doc.surveyResponses || {}, teamChat: doc.teamChat || {}, recordComments: doc.recordComments || {} };
-      return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {} };
+      if (doc) return { cards: doc.cards || {}, packages: doc.packages || {}, auditLog: doc.auditLog || [], licenses: doc.licenses || {}, hubtelStatus: doc.hubtelStatus || {}, businessAuditLog: doc.businessAuditLog || [], portals: doc.portals || {}, surveys: doc.surveys || {}, surveyResponses: doc.surveyResponses || {}, teamChat: doc.teamChat || {}, recordComments: doc.recordComments || {}, updates: doc.updates || [] };
+      return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {}, updates: [] };
     } catch (e) {
       console.error('MongoDB load error, falling back to local file for this boot:', e.message);
     }
@@ -192,10 +192,10 @@ async function loadDB() {
     if (!fs.existsSync(DB_PATH)) return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {} };
     const raw = fs.readFileSync(DB_PATH, 'utf8');
     const parsed = JSON.parse(raw || '{}');
-    return { cards: parsed.cards || {}, packages: parsed.packages || {}, auditLog: parsed.auditLog || [], licenses: parsed.licenses || {}, hubtelStatus: parsed.hubtelStatus || {}, businessAuditLog: parsed.businessAuditLog || [], portals: parsed.portals || {}, surveys: parsed.surveys || {}, surveyResponses: parsed.surveyResponses || {}, teamChat: parsed.teamChat || {}, recordComments: parsed.recordComments || {} };
+    return { cards: parsed.cards || {}, packages: parsed.packages || {}, auditLog: parsed.auditLog || [], licenses: parsed.licenses || {}, hubtelStatus: parsed.hubtelStatus || {}, businessAuditLog: parsed.businessAuditLog || [], portals: parsed.portals || {}, surveys: parsed.surveys || {}, surveyResponses: parsed.surveyResponses || {}, teamChat: parsed.teamChat || {}, recordComments: parsed.recordComments || {}, updates: parsed.updates || [] };
   } catch (e) {
     console.error('DB load error, starting with an empty store:', e.message);
-    return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {} };
+    return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {}, updates: [] };
   }
 }
 
@@ -216,7 +216,7 @@ function saveDB() {
       try {
         await mongoCollection.updateOne(
           { _id: 'db' },
-          { $set: { cards: DB.cards, packages: DB.packages, auditLog: DB.auditLog || [], licenses: DB.licenses || {}, hubtelStatus: DB.hubtelStatus || {}, businessAuditLog: DB.businessAuditLog || [], portals: DB.portals || {}, surveys: DB.surveys || {}, surveyResponses: DB.surveyResponses || {}, teamChat: DB.teamChat || {}, recordComments: DB.recordComments || {}, updatedAt: new Date() } },
+          { $set: { cards: DB.cards, packages: DB.packages, auditLog: DB.auditLog || [], licenses: DB.licenses || {}, hubtelStatus: DB.hubtelStatus || {}, businessAuditLog: DB.businessAuditLog || [], portals: DB.portals || {}, surveys: DB.surveys || {}, surveyResponses: DB.surveyResponses || {}, teamChat: DB.teamChat || {}, recordComments: DB.recordComments || {}, updates: DB.updates || [], updatedAt: new Date() } },
           { upsert: true }
         );
       } catch (e) {
@@ -1160,6 +1160,31 @@ app.get('/api/survey/:id/responses', (req, res) => {
 });
 
 // =====================================================================
+// SYSTEM RELEASE NOTIFICATIONS
+// Beat Digital Consult activates a release once. Every tenant install
+// polls this small public endpoint and records the version locally.
+// =====================================================================
+app.post('/api/admin/updates', requireAdmin, (req, res) => {
+  const version = String(req.body?.version || '').trim();
+  const message = String(req.body?.message || '').trim();
+  if (!version || !message || version.length > 30 || message.length > 500) {
+    return res.status(400).json({ ok: false, error: 'A version and release message are required.' });
+  }
+  DB.updates = DB.updates || [];
+  const update = { version, message, activatedAt: new Date().toISOString(), activatedBy: BRAND.company };
+  DB.updates = [update, ...DB.updates.filter((item) => item.version !== version)].slice(0, 50);
+  saveDB();
+  res.json({ ok: true, update });
+});
+app.get('/api/updates/latest', (req, res) => {
+  const licenseKey = String(req.query.licenseKey || '').trim();
+  if (!licenseKey || !DB.licenses[licenseKey] || licenseStatusOf(DB.licenses[licenseKey]) !== 'active') {
+    return res.status(403).json({ ok: false, error: 'An active license is required.' });
+  }
+  res.json({ ok: true, update: (DB.updates || [])[0] || null });
+});
+
+// =====================================================================
 // SMS SENDING — mNotify (Ghana) or Hubtel SMS, same "bring your own
 // credentials" model as email: nothing is stored server-side, keys
 // travel with each request from the tenant's own Settings.
@@ -1373,6 +1398,7 @@ app.use((req, res) => res.status(404).send(notFoundPage()));
 async function boot() {
   await initMongo();
   DB = await loadDB();
+  DB.updates = DB.updates || [];
   const httpServer = http.createServer(app);
   attachCollaboration(httpServer); // real-time presence, comments, team chat — see below
   httpServer.listen(PORT, () => {
