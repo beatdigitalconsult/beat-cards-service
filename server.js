@@ -216,24 +216,24 @@ async function loadDB() {
   if (mongoCollection) {
     try {
       const doc = await mongoCollection.findOne({ _id: 'db' });
-      if (doc) return { cards: doc.cards || {}, packages: doc.packages || {}, auditLog: doc.auditLog || [], licenses: doc.licenses || {}, hubtelStatus: doc.hubtelStatus || {}, businessAuditLog: doc.businessAuditLog || [], portals: doc.portals || {}, surveys: doc.surveys || {}, surveyResponses: doc.surveyResponses || {}, teamChat: doc.teamChat || {}, recordComments: doc.recordComments || {}, updates: doc.updates || [] };
-      return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {}, updates: [] };
+      if (doc) return { cards: doc.cards || {}, packages: doc.packages || {}, auditLog: doc.auditLog || [], licenses: doc.licenses || {}, hubtelStatus: doc.hubtelStatus || {}, businessAuditLog: doc.businessAuditLog || [], portals: doc.portals || {}, surveys: doc.surveys || {}, surveyResponses: doc.surveyResponses || {}, teamChat: doc.teamChat || {}, recordComments: doc.recordComments || {}, publicApiData: doc.publicApiData || {}, updates: doc.updates || [] };
+      return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {}, publicApiData: {}, updates: [] };
     } catch (e) {
       console.error('MongoDB load error, falling back to local file for this boot:', e.message);
     }
   }
   try {
-    if (!fs.existsSync(DB_PATH)) return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {} };
+    if (!fs.existsSync(DB_PATH)) return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {}, publicApiData: {}, updates: [] };
     const raw = fs.readFileSync(DB_PATH, 'utf8');
     const parsed = JSON.parse(raw || '{}');
-    return { cards: parsed.cards || {}, packages: parsed.packages || {}, auditLog: parsed.auditLog || [], licenses: parsed.licenses || {}, hubtelStatus: parsed.hubtelStatus || {}, businessAuditLog: parsed.businessAuditLog || [], portals: parsed.portals || {}, surveys: parsed.surveys || {}, surveyResponses: parsed.surveyResponses || {}, teamChat: parsed.teamChat || {}, recordComments: parsed.recordComments || {}, updates: parsed.updates || [] };
+    return { cards: parsed.cards || {}, packages: parsed.packages || {}, auditLog: parsed.auditLog || [], licenses: parsed.licenses || {}, hubtelStatus: parsed.hubtelStatus || {}, businessAuditLog: parsed.businessAuditLog || [], portals: parsed.portals || {}, surveys: parsed.surveys || {}, surveyResponses: parsed.surveyResponses || {}, teamChat: parsed.teamChat || {}, recordComments: parsed.recordComments || {}, publicApiData: parsed.publicApiData || {}, updates: parsed.updates || [] };
   } catch (e) {
     console.error('DB load error, starting with an empty store:', e.message);
-    return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {}, updates: [] };
+    return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {}, publicApiData: {}, updates: [] };
   }
 }
 
-let DB = { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {} }; // populated for real just before the server starts listening — see boot() below
+let DB = { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {}, publicApiData: {} }; // populated for real just before the server starts listening — see boot() below
 let saveTimer = null;
 function saveDB() {
   clearTimeout(saveTimer);
@@ -250,7 +250,7 @@ function saveDB() {
       try {
         await mongoCollection.updateOne(
           { _id: 'db' },
-          { $set: { cards: DB.cards, packages: DB.packages, auditLog: DB.auditLog || [], licenses: DB.licenses || {}, hubtelStatus: DB.hubtelStatus || {}, businessAuditLog: DB.businessAuditLog || [], portals: DB.portals || {}, surveys: DB.surveys || {}, surveyResponses: DB.surveyResponses || {}, teamChat: DB.teamChat || {}, recordComments: DB.recordComments || {}, updates: DB.updates || [], updatedAt: new Date() } },
+          { $set: { cards: DB.cards, packages: DB.packages, auditLog: DB.auditLog || [], licenses: DB.licenses || {}, hubtelStatus: DB.hubtelStatus || {}, businessAuditLog: DB.businessAuditLog || [], portals: DB.portals || {}, surveys: DB.surveys || {}, surveyResponses: DB.surveyResponses || {}, teamChat: DB.teamChat || {}, recordComments: DB.recordComments || {}, publicApiData: DB.publicApiData || {}, updates: DB.updates || [], updatedAt: new Date() } },
           { upsert: true }
         );
       } catch (e) {
@@ -1392,10 +1392,20 @@ function attachCollaboration(httpServer) {
 
     socket.on('collab:chatSend', (payload) => {
       if (!room || !payload?.text) return;
-      const msg = { id: newId(), room, author: identity?.name || 'Staff', authorEmail: identity?.email || '', text: String(payload.text).slice(0, 2000), at: new Date().toISOString() };
       DB.teamChat[room] = DB.teamChat[room] || [];
+      // The browser keeps an outbox while offline and may resend after a
+      // reconnect. A clientId makes that retry idempotent instead of
+      // creating duplicate messages.
+      const clientId = String(payload.clientId || '').slice(0, 120);
+      if (clientId) {
+        const existing = DB.teamChat[room].find(m => m.clientId === clientId);
+        if (existing) {
+          socket.emit('collab:chatMessage', existing);
+          return;
+        }
+      }
+      const msg = { id: newId(), clientId: clientId || undefined, room, author: identity?.name || 'Staff', authorEmail: identity?.email || '', text: String(payload.text).slice(0, 2000), at: new Date().toISOString() };
       DB.teamChat[room].push(msg);
-      DB.teamChat[room] = DB.teamChat[room].slice(-500); // cap history per tenant
       saveDB();
       io.to(room).emit('collab:chatMessage', msg);
     });
@@ -1445,8 +1455,10 @@ function requireActivatedDevice(req, res) {
 app.get('/api/collab/:licenseKey/chat', (req, res) => {
   const licenseKey = requireActivatedDevice(req, res);
   if (!licenseKey) return;
-  const messages = (DB.teamChat[licenseKey] || []).slice(-200);
-  res.json({ ok: true, messages });
+  // Team chat is an audit trail, not a temporary socket buffer. Do not trim
+  // older records on reconnect; the client can keep a smaller offline cache.
+  const messages = DB.teamChat[licenseKey] || [];
+  res.json({ ok: true, messages, total: messages.length });
 });
 app.get('/api/collab/:licenseKey/comments/:recordType/:recordId', (req, res) => {
   const licenseKey = requireActivatedDevice(req, res);
