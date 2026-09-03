@@ -1158,6 +1158,18 @@ app.get('/api/survey/:id/responses', (req, res) => {
   if (!s || s.licenseKey !== licenseKey) return res.status(403).json({ ok: false, error: 'Not your survey.' });
   res.json({ ok: true, responses: DB.surveyResponses[req.params.id] || [] });
 });
+// Tenant-owned survey cleanup. The license header is required so one
+// tenant cannot delete another tenant's public survey or responses.
+app.delete('/api/survey/:id', (req, res) => {
+  const licenseKey = req.get('x-license-key') || 'UNKNOWN';
+  const survey = DB.surveys[req.params.id];
+  if (!survey) return res.status(404).json({ ok: false, error: 'Survey not found.' });
+  if (survey.licenseKey !== licenseKey) return res.status(403).json({ ok: false, error: 'Not your survey.' });
+  delete DB.surveys[req.params.id];
+  delete DB.surveyResponses[req.params.id];
+  saveDB();
+  res.json({ ok: true });
+});
 
 // =====================================================================
 // SYSTEM RELEASE NOTIFICATIONS
