@@ -94,16 +94,47 @@ app.use(publicLimiter);
 // ---------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 // If ADMIN_KEY isn't set in the environment, generate a strong random
-// one for this boot instead of falling back to a fixed, guessable
-// string. This closes the "forgot to set it" hole — a fixed default
-// left in place would let anyone approve/revoke Digital Card
-// packages for any client. A freshly-generated key still needs to be
-// set as a persistent env var (it changes every restart otherwise,
-// which will lock the owner app out of admin actions) — the boot log
-// below prints it once, loudly, so it can be copied into Render/
-// Railway/Fly's environment variable settings.
-const ADMIN_KEY = process.env.ADMIN_KEY || crypto.randomBytes(24).toString('hex');
-const ADMIN_KEY_WAS_GENERATED = !process.env.ADMIN_KEY;
+// one instead of falling back to a fixed, guessable string. This
+// closes the "forgot to set it" hole — a fixed default left in place
+// would let anyone approve/revoke licenses or Digital Card packages
+// for any client.
+//
+// BUG FIX (Sept 2026): the generated key used to be re-rolled on
+// EVERY boot, which silently broke every admin action (revoke,
+// reactivate, plan edits, sync) the moment the host restarted the
+// process (Render's free tier does this often — spin-downs,
+// redeploys, etc). From the owner's point of view this looked like
+// "I revoked a license and it turned back active" — what actually
+// happened is the revoke call itself was rejected with 401 (wrong/
+// stale admin key), so it never reached the server at all, and the
+// next background sync then pulled the server's still-active record
+// back over the local copy. To fix this for real without any manual
+// setup, a generated key is now persisted to disk the first time it's
+// created and reused on every subsequent boot, so it stays stable
+// across ordinary restarts on the SAME deployed instance. A full
+// redeploy (or a host with a wiped filesystem) will still roll a new
+// one — setting ADMIN_KEY as a permanent environment variable in your
+// host's dashboard remains the fully-durable fix and always wins over
+// the persisted file.
+const ADMIN_KEY_PATH = path.join(__dirname, 'data', 'admin_key.txt');
+function resolveAdminKey() {
+  if (process.env.ADMIN_KEY) return { key: process.env.ADMIN_KEY, source: 'env' };
+  try {
+    const existing = fs.readFileSync(ADMIN_KEY_PATH, 'utf8').trim();
+    if (existing) return { key: existing, source: 'persisted-file' };
+  } catch (e) { /* no persisted key yet — fall through and create one */ }
+  const generated = crypto.randomBytes(24).toString('hex');
+  try {
+    fs.mkdirSync(path.dirname(ADMIN_KEY_PATH), { recursive: true });
+    fs.writeFileSync(ADMIN_KEY_PATH, generated);
+  } catch (e) {
+    console.error('Could not persist generated ADMIN_KEY to disk — it will change on next restart:', e.message);
+  }
+  return { key: generated, source: 'generated' };
+}
+const _adminKeyResolved = resolveAdminKey();
+const ADMIN_KEY = _adminKeyResolved.key;
+const ADMIN_KEY_WAS_GENERATED = _adminKeyResolved.source !== 'env';
 const MONGODB_URI = process.env.MONGODB_URI || '';
 const OWNER_LICENSE_KEY = 'BD-OWNER'; // sentinel used by the Beat Digital Consult install itself
 const DB_PATH = path.join(__dirname, 'data', 'db.json');
@@ -116,13 +147,16 @@ const BRAND = {
 };
 
 if (ADMIN_KEY_WAS_GENERATED) {
-  console.warn('\n⚠️  ADMIN_KEY environment variable is not set — generated a');
-  console.warn('   temporary one for THIS BOOT ONLY (it will change on every');
-  console.warn('   restart until you set it permanently):\n');
+  console.warn('\n⚠️  ADMIN_KEY environment variable is not set — using a');
+  console.warn(`   ${_adminKeyResolved.source === 'persisted-file' ? 'previously-generated key persisted on disk' : 'freshly-generated key (now saved to disk for reuse)'}:\n`);
   console.warn(`   ADMIN_KEY=${ADMIN_KEY}\n`);
-  console.warn('   Set this as a persistent environment variable on your host');
-  console.warn('   (Render/Railway/Fly → Environment) and paste the SAME value');
-  console.warn('   into the BMS desktop app under Settings → 🌐 Card Hosting.\n');
+  console.warn('   This key will now survive ordinary restarts, but a full');
+  console.warn('   redeploy or a host that wipes its disk will still roll a new');
+  console.warn('   one and lock the owner app out of admin actions (revoke,');
+  console.warn('   reactivate, plan edits) until it is updated. For guaranteed');
+  console.warn('   stability, set this as a permanent environment variable on');
+  console.warn('   your host (Render/Railway/Fly → Environment) and paste the');
+  console.warn('   SAME value into the BMS desktop app under Settings → 🌐 Card Hosting.\n');
 }
 
 // ---------------------------------------------------------------
