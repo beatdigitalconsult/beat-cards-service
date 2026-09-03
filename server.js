@@ -614,6 +614,15 @@ function parseLicenseKey(key) {
   return { key: parts.join('-'), plan };
 }
 
+// License keys are entered manually, copied from email, and restored from
+// older backups. Keep every collaboration lookup on the same canonical key
+// used by the check-in and admin endpoints. Without this, a harmless casing
+// or whitespace difference made Socket.IO look up a missing license and
+// report the misleading "License is not active" message.
+function canonicalLicenseKey(key) {
+  return String(key || '').trim().toUpperCase();
+}
+
 function licenseStatusOf(lic) {
   if (!lic) return 'not-found';
   if (lic.status !== 'active') return lic.status;
@@ -732,6 +741,16 @@ app.post('/api/admin/licenses/:key/transfer', requireAdmin, (req, res) => {
 
 app.get('/api/admin/licenses', requireAdmin, (req, res) => {
   res.json({ ok: true, licenses: DB.licenses });
+});
+
+// Return one authoritative record so the desktop app can verify a revoke
+// instead of treating a successful HTTP response alone as proof. This is
+// intentionally admin-only because it exposes activation/device metadata.
+app.get('/api/admin/licenses/:key', requireAdmin, (req, res) => {
+  const key = canonicalLicenseKey(req.params.key);
+  const license = DB.licenses[key];
+  if (!license) return res.status(404).json({ ok: false, error: 'License not found on server.' });
+  res.json({ ok: true, license });
 });
 
 // Permanently removes a license record from the server, as opposed to
@@ -1304,8 +1323,9 @@ function attachCollaboration(httpServer) {
     let room = null, identity = null;
 
     socket.on('collab:join', (payload) => {
-      const licenseKey = (payload && payload.licenseKey) || null;
+      const rawLicenseKey = (payload && payload.licenseKey) || null;
       const deviceId = (payload && payload.deviceId) || null;
+      const licenseKey = canonicalLicenseKey(rawLicenseKey);
       if (!licenseKey || !deviceId) {
         socket.emit('collab:joinError', { error: 'Missing license key or device ID.' });
         return;
@@ -1323,8 +1343,18 @@ function attachCollaboration(httpServer) {
       const status = licenseStatusOf(lic);
       const adminKey = payload.adminKey || socket.handshake.auth?.adminKey || '';
       const isOwnerSession = licenseKey === OWNER_LICENSE_KEY && adminKey === ADMIN_KEY;
+      if (!isOwnerSession && !parseLicenseKey(licenseKey)) {
+        socket.emit('collab:joinError', { code: 'invalid-license', error: 'Invalid license key — cannot join team chat.' });
+        return;
+      }
       if (!isOwnerSession && status !== 'active') {
-        socket.emit('collab:joinError', { error: 'License is not active — cannot join team chat.' });
+        socket.emit('collab:joinError', {
+          code: status === 'not-found' ? 'license-not-found' : status,
+          status,
+          error: status === 'not-found'
+            ? 'License was not found on the hosting server — ask the account admin to sync the license, then retry.'
+            : `License is ${status} — cannot join team chat.`
+        });
         return;
       }
       const knownDevice = (lic?.activations || []).some(a => a.deviceId === deviceId);
@@ -1400,7 +1430,7 @@ function attachCollaboration(httpServer) {
 // since these are simple GETs, not the POST-with-body pattern used
 // elsewhere.
 function requireActivatedDevice(req, res) {
-  const licenseKey = req.params.licenseKey || req.get('x-license-key');
+  const licenseKey = canonicalLicenseKey(req.params.licenseKey || req.get('x-license-key'));
   const deviceId = req.get('x-device-id');
   const isOwnerSession = licenseKey === OWNER_LICENSE_KEY && req.get('x-admin-key') === ADMIN_KEY;
   if (isOwnerSession) return licenseKey;
@@ -1436,6 +1466,14 @@ app.use((req, res) => res.status(404).send(notFoundPage()));
 async function boot() {
   await initMongo();
   DB = await loadDB();
+  // Migrate records written by older builds that did not canonicalize the
+  // key at write time. This keeps existing clients, chat rooms, and revoke
+  // operations working after the server is upgraded.
+  DB.licenses = Object.entries(DB.licenses || {}).reduce((out, [key, license]) => {
+    const canonical = canonicalLicenseKey(key);
+    out[canonical] = { ...license, key: canonical };
+    return out;
+  }, {});
   DB.updates = DB.updates || [];
   const httpServer = http.createServer(app);
   attachCollaboration(httpServer); // real-time presence, comments, team chat — see below
