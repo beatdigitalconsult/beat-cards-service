@@ -99,31 +99,57 @@ const PORT = process.env.PORT || 3000;
 // would let anyone approve/revoke licenses or Digital Card packages
 // for any client.
 //
-// BUG FIX (Sept 2026): the generated key used to be re-rolled on
-// EVERY boot, which silently broke every admin action (revoke,
+// BUG FIX (Sept 2026, round 1): the generated key used to be re-rolled
+// on EVERY boot, which silently broke every admin action (revoke,
 // reactivate, plan edits, sync) the moment the host restarted the
-// process (Render's free tier does this often — spin-downs,
-// redeploys, etc). From the owner's point of view this looked like
-// "I revoked a license and it turned back active" — what actually
-// happened is the revoke call itself was rejected with 401 (wrong/
-// stale admin key), so it never reached the server at all, and the
-// next background sync then pulled the server's still-active record
-// back over the local copy. To fix this for real without any manual
-// setup, a generated key is now persisted to disk the first time it's
-// created and reused on every subsequent boot, so it stays stable
-// across ordinary restarts on the SAME deployed instance. A full
-// redeploy (or a host with a wiped filesystem) will still roll a new
-// one — setting ADMIN_KEY as a permanent environment variable in your
-// host's dashboard remains the fully-durable fix and always wins over
-// the persisted file.
+// process. A generated key was then persisted to a local file and
+// reused on the next boot — this helped, but NOT on hosts like
+// Render's free tier, whose filesystem is completely ephemeral: it is
+// wiped on every restart/spin-down/redeploy, so a file-only fix still
+// rolled a brand-new key constantly, and revokes kept failing with a
+// generic "could not reach the licensing server" error even though
+// the server was actually up and reachable — it was just rejecting
+// the app's now-stale admin key with a 401.
+//
+// BUG FIX (round 2 — this one is the durable one): when MONGODB_URI is
+// configured (see initMongo() below — the same store already used to
+// keep cards/licenses safe across restarts), the admin key is now
+// persisted there too and reused on every boot, the same way the rest
+// of the database already is. That survives restarts, spin-downs, AND
+// redeploys, without needing a persistent disk at all. The local file
+// remains as a fallback for setups with no MongoDB configured, and
+// setting ADMIN_KEY as a permanent environment variable on your host
+// remains the simplest, fully-durable option and always wins over
+// both stores.
 const ADMIN_KEY_PATH = path.join(__dirname, 'data', 'admin_key.txt');
-function resolveAdminKey() {
+async function resolveAdminKey() {
   if (process.env.ADMIN_KEY) return { key: process.env.ADMIN_KEY, source: 'env' };
+  if (mongoCollection) {
+    try {
+      const doc = await mongoCollection.findOne({ _id: 'admin_key' });
+      if (doc && doc.key) return { key: doc.key, source: 'mongo' };
+    } catch (e) {
+      console.error('Could not read persisted ADMIN_KEY from MongoDB — falling back:', e.message);
+    }
+  }
   try {
     const existing = fs.readFileSync(ADMIN_KEY_PATH, 'utf8').trim();
     if (existing) return { key: existing, source: 'persisted-file' };
   } catch (e) { /* no persisted key yet — fall through and create one */ }
   const generated = crypto.randomBytes(24).toString('hex');
+  // Persist everywhere available so the NEXT restart (even one that
+  // wipes local disk entirely) still finds the same key.
+  if (mongoCollection) {
+    try {
+      await mongoCollection.updateOne(
+        { _id: 'admin_key' },
+        { $set: { key: generated, createdAt: new Date() } },
+        { upsert: true }
+      );
+    } catch (e) {
+      console.error('Could not persist generated ADMIN_KEY to MongoDB:', e.message);
+    }
+  }
   try {
     fs.mkdirSync(path.dirname(ADMIN_KEY_PATH), { recursive: true });
     fs.writeFileSync(ADMIN_KEY_PATH, generated);
@@ -132,9 +158,13 @@ function resolveAdminKey() {
   }
   return { key: generated, source: 'generated' };
 }
-const _adminKeyResolved = resolveAdminKey();
-const ADMIN_KEY = _adminKeyResolved.key;
-const ADMIN_KEY_WAS_GENERATED = _adminKeyResolved.source !== 'env';
+// Resolved for real inside boot(), after initMongo() has had a chance to
+// connect — see boot() near the bottom of this file. No request can reach
+// requireAdmin() before then, because httpServer.listen() is also called
+// from inside boot(), after this is set.
+let ADMIN_KEY = '';
+let ADMIN_KEY_WAS_GENERATED = true;
+let ADMIN_KEY_SOURCE = '';
 const MONGODB_URI = process.env.MONGODB_URI || '';
 const OWNER_LICENSE_KEY = 'BD-OWNER'; // sentinel used by the Beat Digital Consult install itself
 const DB_PATH = path.join(__dirname, 'data', 'db.json');
@@ -146,18 +176,10 @@ const BRAND = {
   supportEmail: 'admin@beatdigital.tech'
 };
 
-if (ADMIN_KEY_WAS_GENERATED) {
-  console.warn('\n⚠️  ADMIN_KEY environment variable is not set — using a');
-  console.warn(`   ${_adminKeyResolved.source === 'persisted-file' ? 'previously-generated key persisted on disk' : 'freshly-generated key (now saved to disk for reuse)'}:\n`);
-  console.warn(`   ADMIN_KEY=${ADMIN_KEY}\n`);
-  console.warn('   This key will now survive ordinary restarts, but a full');
-  console.warn('   redeploy or a host that wipes its disk will still roll a new');
-  console.warn('   one and lock the owner app out of admin actions (revoke,');
-  console.warn('   reactivate, plan edits) until it is updated. For guaranteed');
-  console.warn('   stability, set this as a permanent environment variable on');
-  console.warn('   your host (Render/Railway/Fly → Environment) and paste the');
-  console.warn('   SAME value into the BMS desktop app under Settings → 🌐 Card Hosting.\n');
-}
+// Admin-key startup warning is now printed from inside boot(), once the
+// key has actually been resolved (see resolveAdminKey() above) — logging
+// it here was too early to reflect the real, final source (env/Mongo/
+// file/generated).
 
 // ---------------------------------------------------------------
 // PERSISTENCE
@@ -326,7 +348,7 @@ app.get('/', (req, res) => {
   </div></body></html>`);
 });
 
-app.get('/healthz', (req, res) => res.json({ ok: true, product: BRAND.product, company: BRAND.company, cards: Object.keys(DB.cards).length, storage: mongoCollection ? 'mongodb' : 'file-only (not persistent on Render free tier)' }));
+app.get('/healthz', (req, res) => res.json({ ok: true, product: BRAND.product, company: BRAND.company, cards: Object.keys(DB.cards).length, storage: mongoCollection ? 'mongodb' : 'file-only (not persistent on Render free tier)', adminKeyDurable: ADMIN_KEY_SOURCE === 'env' || ADMIN_KEY_SOURCE === 'mongo', adminKeySource: ADMIN_KEY_SOURCE }));
 
 // ---------------------------------------------------------------
 // CARD SYNC  (called by the BMS desktop app whenever a card is saved)
@@ -1477,6 +1499,35 @@ app.use((req, res) => res.status(404).send(notFoundPage()));
 // ---------------------------------------------------------------
 async function boot() {
   await initMongo();
+  const resolvedAdminKey = await resolveAdminKey();
+  ADMIN_KEY = resolvedAdminKey.key;
+  ADMIN_KEY_SOURCE = resolvedAdminKey.source;
+  ADMIN_KEY_WAS_GENERATED = resolvedAdminKey.source !== 'env';
+  if (ADMIN_KEY_WAS_GENERATED) {
+    const durable = ADMIN_KEY_SOURCE === 'mongo';
+    console.warn('\n⚠️  ADMIN_KEY environment variable is not set — using a');
+    console.warn(`   ${{
+      mongo: 'previously-generated key persisted in MongoDB (durable — survives redeploys)',
+      'persisted-file': 'previously-generated key persisted on local disk',
+      generated: 'freshly-generated key' + (mongoCollection ? ' (now saved to MongoDB for reuse)' : ' (now saved to disk for reuse)')
+    }[ADMIN_KEY_SOURCE] || 'generated key'}:\n`);
+    console.warn(`   ADMIN_KEY=${ADMIN_KEY}\n`);
+    if (durable) {
+      console.warn('   This key is stored in MongoDB, so it will survive ordinary');
+      console.warn('   restarts, spin-downs, AND full redeploys — admin actions');
+      console.warn('   (revoke, reactivate, plan edits) will keep working without');
+      console.warn('   any further setup on your part.\n');
+    } else {
+      console.warn('   This key will survive ordinary restarts, but a full redeploy');
+      console.warn('   or a host that wipes its disk will still roll a new one and');
+      console.warn('   lock the owner app out of admin actions (revoke, reactivate,');
+      console.warn('   plan edits) until it is updated. Set MONGODB_URI (see above)');
+      console.warn('   for a fully durable key, or set ADMIN_KEY as a permanent');
+      console.warn('   environment variable on your host (Render/Railway/Fly →');
+      console.warn('   Environment) and paste the SAME value into the BMS desktop');
+      console.warn('   app under Settings → 🌐 Card Hosting.\n');
+    }
+  }
   DB = await loadDB();
   // Migrate records written by older builds that did not canonicalize the
   // key at write time. This keeps existing clients, chat rooms, and revoke
