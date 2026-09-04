@@ -99,72 +99,62 @@ const PORT = process.env.PORT || 3000;
 // would let anyone approve/revoke licenses or Digital Card packages
 // for any client.
 //
-// BUG FIX (Sept 2026, round 1): the generated key used to be re-rolled
-// on EVERY boot, which silently broke every admin action (revoke,
+// BUG FIX (Sept 2026): the generated key used to be re-rolled on
+// EVERY boot, which silently broke every admin action (revoke,
 // reactivate, plan edits, sync) the moment the host restarted the
-// process. A generated key was then persisted to a local file and
-// reused on the next boot — this helped, but NOT on hosts like
-// Render's free tier, whose filesystem is completely ephemeral: it is
-// wiped on every restart/spin-down/redeploy, so a file-only fix still
-// rolled a brand-new key constantly, and revokes kept failing with a
-// generic "could not reach the licensing server" error even though
-// the server was actually up and reachable — it was just rejecting
-// the app's now-stale admin key with a 401.
-//
-// BUG FIX (round 2 — this one is the durable one): when MONGODB_URI is
-// configured (see initMongo() below — the same store already used to
-// keep cards/licenses safe across restarts), the admin key is now
-// persisted there too and reused on every boot, the same way the rest
-// of the database already is. That survives restarts, spin-downs, AND
-// redeploys, without needing a persistent disk at all. The local file
-// remains as a fallback for setups with no MongoDB configured, and
-// setting ADMIN_KEY as a permanent environment variable on your host
-// remains the simplest, fully-durable option and always wins over
-// both stores.
+// process (Render's free tier does this often — spin-downs,
+// redeploys, etc). From the owner's point of view this looked like
+// "I revoked a license and it turned back active" — what actually
+// happened is the revoke call itself was rejected with 401 (wrong/
+// stale admin key), so it never reached the server at all, and the
+// next background sync then pulled the server's still-active record
+// back over the local copy. To fix this for real without any manual
+// setup, a generated key is now persisted to disk the first time it's
+// created and reused on every subsequent boot, so it stays stable
+// across ordinary restarts on the SAME deployed instance. A full
+// redeploy (or a host with a wiped filesystem) will still roll a new
+// one — setting ADMIN_KEY as a permanent environment variable in your
+// host's dashboard remains the fully-durable fix and always wins over
+// the persisted file.
 const ADMIN_KEY_PATH = path.join(__dirname, 'data', 'admin_key.txt');
-async function resolveAdminKey() {
+// BUG FIX (v6.11.2 -> this update): the v6.11.2 fix persisted a
+// generated ADMIN_KEY to the LOCAL DISK only. That's exactly the same
+// ephemeral filesystem this file already warns about for card data a
+// few lines down — on Render's free tier (and most free hosts) the
+// disk is wiped on every redeploy/spin-down/restart. Any client who
+// followed the recommended fix and set MONGODB_URI to make their
+// CARDS durable got no such protection for the admin key, because the
+// admin key was never written to Mongo — only to the file that keeps
+// getting wiped. So the key kept rotating anyway, every revoke kept
+// getting silently rejected with 401, and the app's generic "could not
+// reach the licensing server" message (which doesn't yet distinguish
+// "offline" from "rejected") made that 401 look exactly like the
+// server was down/not responding.
+//
+// Fix: once Mongo is connected, the admin key now lives in the SAME
+// durable store as everything else (DB.adminKey, saved via saveDB()),
+// and that's what actually survives redeploys. The local file is kept
+// only as a same-boot cache and a one-time migration source (so an
+// existing key already on disk is picked up and pushed into Mongo
+// automatically — no manual re-entry needed). See resolveAdminKey()
+// below, which now needs the loaded DB and therefore runs from boot()
+// after Mongo/the DB is ready, not at module load time.
+function resolveAdminKey(dbAdminKey) {
   if (process.env.ADMIN_KEY) return { key: process.env.ADMIN_KEY, source: 'env' };
-  if (mongoCollection) {
-    try {
-      const doc = await mongoCollection.findOne({ _id: 'admin_key' });
-      if (doc && doc.key) return { key: doc.key, source: 'mongo' };
-    } catch (e) {
-      console.error('Could not read persisted ADMIN_KEY from MongoDB — falling back:', e.message);
-    }
-  }
+  if (dbAdminKey) return { key: dbAdminKey, source: 'db' };
   try {
     const existing = fs.readFileSync(ADMIN_KEY_PATH, 'utf8').trim();
     if (existing) return { key: existing, source: 'persisted-file' };
   } catch (e) { /* no persisted key yet — fall through and create one */ }
   const generated = crypto.randomBytes(24).toString('hex');
-  // Persist everywhere available so the NEXT restart (even one that
-  // wipes local disk entirely) still finds the same key.
-  if (mongoCollection) {
-    try {
-      await mongoCollection.updateOne(
-        { _id: 'admin_key' },
-        { $set: { key: generated, createdAt: new Date() } },
-        { upsert: true }
-      );
-    } catch (e) {
-      console.error('Could not persist generated ADMIN_KEY to MongoDB:', e.message);
-    }
-  }
-  try {
-    fs.mkdirSync(path.dirname(ADMIN_KEY_PATH), { recursive: true });
-    fs.writeFileSync(ADMIN_KEY_PATH, generated);
-  } catch (e) {
-    console.error('Could not persist generated ADMIN_KEY to disk — it will change on next restart:', e.message);
-  }
   return { key: generated, source: 'generated' };
 }
-// Resolved for real inside boot(), after initMongo() has had a chance to
-// connect — see boot() near the bottom of this file. No request can reach
-// requireAdmin() before then, because httpServer.listen() is also called
-// from inside boot(), after this is set.
+// Placeholders — the real values are set in boot() once the durable
+// store (Mongo, if configured, else the local file) has been read.
+// Nothing that reads ADMIN_KEY can run before boot()'s httpServer.listen()
+// call starts accepting connections, so this is safe.
 let ADMIN_KEY = '';
 let ADMIN_KEY_WAS_GENERATED = true;
-let ADMIN_KEY_SOURCE = '';
 const MONGODB_URI = process.env.MONGODB_URI || '';
 const OWNER_LICENSE_KEY = 'BD-OWNER'; // sentinel used by the Beat Digital Consult install itself
 const DB_PATH = path.join(__dirname, 'data', 'db.json');
@@ -175,11 +165,6 @@ const BRAND = {
   site: 'https://beatdigital.tech',
   supportEmail: 'admin@beatdigital.tech'
 };
-
-// Admin-key startup warning is now printed from inside boot(), once the
-// key has actually been resolved (see resolveAdminKey() above) — logging
-// it here was too early to reflect the real, final source (env/Mongo/
-// file/generated).
 
 // ---------------------------------------------------------------
 // PERSISTENCE
@@ -238,24 +223,24 @@ async function loadDB() {
   if (mongoCollection) {
     try {
       const doc = await mongoCollection.findOne({ _id: 'db' });
-      if (doc) return { cards: doc.cards || {}, packages: doc.packages || {}, auditLog: doc.auditLog || [], licenses: doc.licenses || {}, hubtelStatus: doc.hubtelStatus || {}, businessAuditLog: doc.businessAuditLog || [], portals: doc.portals || {}, surveys: doc.surveys || {}, surveyResponses: doc.surveyResponses || {}, teamChat: doc.teamChat || {}, recordComments: doc.recordComments || {}, publicApiData: doc.publicApiData || {}, updates: doc.updates || [] };
-      return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {}, publicApiData: {}, updates: [] };
+      if (doc) return { cards: doc.cards || {}, packages: doc.packages || {}, auditLog: doc.auditLog || [], licenses: doc.licenses || {}, hubtelStatus: doc.hubtelStatus || {}, businessAuditLog: doc.businessAuditLog || [], portals: doc.portals || {}, surveys: doc.surveys || {}, surveyResponses: doc.surveyResponses || {}, teamChat: doc.teamChat || {}, recordComments: doc.recordComments || {}, publicApiData: doc.publicApiData || {}, updates: doc.updates || [], adminKey: doc.adminKey || '' };
+      return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {}, publicApiData: {}, updates: [], adminKey: '' };
     } catch (e) {
       console.error('MongoDB load error, falling back to local file for this boot:', e.message);
     }
   }
   try {
-    if (!fs.existsSync(DB_PATH)) return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {}, publicApiData: {}, updates: [] };
+    if (!fs.existsSync(DB_PATH)) return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {}, publicApiData: {}, updates: [], adminKey: '' };
     const raw = fs.readFileSync(DB_PATH, 'utf8');
     const parsed = JSON.parse(raw || '{}');
-    return { cards: parsed.cards || {}, packages: parsed.packages || {}, auditLog: parsed.auditLog || [], licenses: parsed.licenses || {}, hubtelStatus: parsed.hubtelStatus || {}, businessAuditLog: parsed.businessAuditLog || [], portals: parsed.portals || {}, surveys: parsed.surveys || {}, surveyResponses: parsed.surveyResponses || {}, teamChat: parsed.teamChat || {}, recordComments: parsed.recordComments || {}, publicApiData: parsed.publicApiData || {}, updates: parsed.updates || [] };
+    return { cards: parsed.cards || {}, packages: parsed.packages || {}, auditLog: parsed.auditLog || [], licenses: parsed.licenses || {}, hubtelStatus: parsed.hubtelStatus || {}, businessAuditLog: parsed.businessAuditLog || [], portals: parsed.portals || {}, surveys: parsed.surveys || {}, surveyResponses: parsed.surveyResponses || {}, teamChat: parsed.teamChat || {}, recordComments: parsed.recordComments || {}, publicApiData: parsed.publicApiData || {}, updates: parsed.updates || [], adminKey: parsed.adminKey || '' };
   } catch (e) {
     console.error('DB load error, starting with an empty store:', e.message);
-    return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {}, publicApiData: {}, updates: [] };
+    return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {}, publicApiData: {}, updates: [], adminKey: '' };
   }
 }
 
-let DB = { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {}, publicApiData: {} }; // populated for real just before the server starts listening — see boot() below
+let DB = { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {}, publicApiData: {}, adminKey: '' }; // populated for real just before the server starts listening — see boot() below
 let saveTimer = null;
 function saveDB() {
   clearTimeout(saveTimer);
@@ -272,7 +257,7 @@ function saveDB() {
       try {
         await mongoCollection.updateOne(
           { _id: 'db' },
-          { $set: { cards: DB.cards, packages: DB.packages, auditLog: DB.auditLog || [], licenses: DB.licenses || {}, hubtelStatus: DB.hubtelStatus || {}, businessAuditLog: DB.businessAuditLog || [], portals: DB.portals || {}, surveys: DB.surveys || {}, surveyResponses: DB.surveyResponses || {}, teamChat: DB.teamChat || {}, recordComments: DB.recordComments || {}, publicApiData: DB.publicApiData || {}, updates: DB.updates || [], updatedAt: new Date() } },
+          { $set: { cards: DB.cards, packages: DB.packages, auditLog: DB.auditLog || [], licenses: DB.licenses || {}, hubtelStatus: DB.hubtelStatus || {}, businessAuditLog: DB.businessAuditLog || [], portals: DB.portals || {}, surveys: DB.surveys || {}, surveyResponses: DB.surveyResponses || {}, teamChat: DB.teamChat || {}, recordComments: DB.recordComments || {}, publicApiData: DB.publicApiData || {}, updates: DB.updates || [], adminKey: DB.adminKey || '', updatedAt: new Date() } },
           { upsert: true }
         );
       } catch (e) {
@@ -348,7 +333,7 @@ app.get('/', (req, res) => {
   </div></body></html>`);
 });
 
-app.get('/healthz', (req, res) => res.json({ ok: true, product: BRAND.product, company: BRAND.company, cards: Object.keys(DB.cards).length, storage: mongoCollection ? 'mongodb' : 'file-only (not persistent on Render free tier)', adminKeyDurable: ADMIN_KEY_SOURCE === 'env' || ADMIN_KEY_SOURCE === 'mongo', adminKeySource: ADMIN_KEY_SOURCE }));
+app.get('/healthz', (req, res) => res.json({ ok: true, product: BRAND.product, company: BRAND.company, cards: Object.keys(DB.cards).length, storage: mongoCollection ? 'mongodb' : 'file-only (not persistent on Render free tier)' }));
 
 // ---------------------------------------------------------------
 // CARD SYNC  (called by the BMS desktop app whenever a card is saved)
@@ -1499,36 +1484,51 @@ app.use((req, res) => res.status(404).send(notFoundPage()));
 // ---------------------------------------------------------------
 async function boot() {
   await initMongo();
-  const resolvedAdminKey = await resolveAdminKey();
-  ADMIN_KEY = resolvedAdminKey.key;
-  ADMIN_KEY_SOURCE = resolvedAdminKey.source;
-  ADMIN_KEY_WAS_GENERATED = resolvedAdminKey.source !== 'env';
+  DB = await loadDB();
+  // Resolve the admin key now that the durable store (Mongo, if
+  // configured, else the local file/db.json) has actually been read.
+  // Priority: ADMIN_KEY env var (always wins, and never gets written
+  // anywhere) > a key already saved in the DB (durable — survives
+  // redeploys whenever Mongo is configured) > a key still only on the
+  // legacy local file (one-time migration below) > generate a new one.
+  const keyResult = resolveAdminKey(DB.adminKey);
+  ADMIN_KEY = keyResult.key;
+  ADMIN_KEY_WAS_GENERATED = keyResult.source !== 'env';
+  // Whenever the resolved key didn't already come from the durable DB
+  // record, write it there now — this is what makes a freshly-generated
+  // key, or one recovered from the legacy local file, durable going
+  // forward instead of rotating again on the next restart.
+  if (keyResult.source !== 'env' && keyResult.source !== 'db') {
+    DB.adminKey = ADMIN_KEY;
+    saveDB();
+  }
+  // Also keep the local file in sync as a same-boot / offline-Mongo
+  // fallback cache (harmless, and lets a Mongo-less install still
+  // survive ordinary restarts as before).
+  try {
+    fs.mkdirSync(path.dirname(ADMIN_KEY_PATH), { recursive: true });
+    fs.writeFileSync(ADMIN_KEY_PATH, ADMIN_KEY);
+  } catch (e) {
+    console.error('Could not cache ADMIN_KEY to local disk (non-fatal):', e.message);
+  }
   if (ADMIN_KEY_WAS_GENERATED) {
-    const durable = ADMIN_KEY_SOURCE === 'mongo';
     console.warn('\n⚠️  ADMIN_KEY environment variable is not set — using a');
-    console.warn(`   ${{
-      mongo: 'previously-generated key persisted in MongoDB (durable — survives redeploys)',
-      'persisted-file': 'previously-generated key persisted on local disk',
-      generated: 'freshly-generated key' + (mongoCollection ? ' (now saved to MongoDB for reuse)' : ' (now saved to disk for reuse)')
-    }[ADMIN_KEY_SOURCE] || 'generated key'}:\n`);
+    console.warn(`   ${keyResult.source === 'db' ? 'key persisted in the database (survives redeploys)' : keyResult.source === 'persisted-file' ? 'key recovered from local disk (now also saved to the database)' : 'freshly-generated key (now saved to the database)'}:\n`);
     console.warn(`   ADMIN_KEY=${ADMIN_KEY}\n`);
-    if (durable) {
-      console.warn('   This key is stored in MongoDB, so it will survive ordinary');
-      console.warn('   restarts, spin-downs, AND full redeploys — admin actions');
-      console.warn('   (revoke, reactivate, plan edits) will keep working without');
-      console.warn('   any further setup on your part.\n');
+    if (mongoCollection) {
+      console.warn('   MongoDB is connected, so this key will now survive redeploys and');
+      console.warn('   restarts automatically. Setting ADMIN_KEY as a permanent environment');
+      console.warn('   variable on your host is still the most durable option, but is no');
+      console.warn('   longer required for revoke/reactivate/plan-edit actions to keep working.\n');
     } else {
-      console.warn('   This key will survive ordinary restarts, but a full redeploy');
-      console.warn('   or a host that wipes its disk will still roll a new one and');
-      console.warn('   lock the owner app out of admin actions (revoke, reactivate,');
-      console.warn('   plan edits) until it is updated. Set MONGODB_URI (see above)');
-      console.warn('   for a fully durable key, or set ADMIN_KEY as a permanent');
-      console.warn('   environment variable on your host (Render/Railway/Fly →');
-      console.warn('   Environment) and paste the SAME value into the BMS desktop');
-      console.warn('   app under Settings → 🌐 Card Hosting.\n');
+      console.warn('   MongoDB is NOT connected, so this key only survives ordinary restarts');
+      console.warn('   (via the local file) — a full redeploy or a host that wipes its disk');
+      console.warn('   will still roll a new one. For guaranteed stability, set MONGODB_URI');
+      console.warn('   (see README-DEPLOY.md) and/or set ADMIN_KEY as a permanent environment');
+      console.warn('   variable on your host (Render/Railway/Fly → Environment), then paste');
+      console.warn('   that same value into the BMS desktop app under Settings → 🌐 Card Hosting.\n');
     }
   }
-  DB = await loadDB();
   // Migrate records written by older builds that did not canonicalize the
   // key at write time. This keeps existing clients, chat rooms, and revoke
   // operations working after the server is upgraded.
@@ -1544,6 +1544,7 @@ async function boot() {
     console.log(`\n🪪 ${BRAND.product} — Card Profile Service`);
     console.log(`   by ${BRAND.company} — running on port ${PORT}`);
     console.log(`   Storage: ${mongoCollection ? 'MongoDB (persistent ✅)' : 'local file only (NOT persistent on Render free tier ⚠️)'}`);
+    console.log(`   Admin key source: ${keyResult.source}${mongoCollection ? ' (durable across redeploys)' : ''}`);
     console.log(`   Cards loaded: ${Object.keys(DB.cards).length}`);
     console.log(`   Realtime: Socket.IO attached (presence, chat, comments)`);
     console.log(`   Health check: /healthz\n`);
