@@ -46,7 +46,7 @@ app.use(express.json({ limit: '6mb' }));
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, x-license-key, x-admin-key, x-device-id, x-user-name, x-user-email');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, x-license-key, x-admin-key');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -1466,35 +1466,6 @@ app.get('/api/collab/:licenseKey/chat', (req, res) => {
   // older records on reconnect; the client can keep a smaller offline cache.
   const messages = DB.teamChat[licenseKey] || [];
   res.json({ ok: true, messages, total: messages.length });
-});
-// Authenticated REST write fallback for team chat. Socket.IO is preferred
-// for live delivery, but some corporate networks block WebSockets/polling.
-// Keeping the same idempotent clientId contract means staff can still send
-// messages and queued offline messages are not lost or duplicated.
-app.post('/api/collab/:licenseKey/chat', (req, res) => {
-  const licenseKey = requireActivatedDevice(req, res);
-  if (!licenseKey) return;
-  const text = String(req.body?.text || '').trim().slice(0, 2000);
-  if (!text) return res.status(400).json({ ok: false, error: 'Message text is required.' });
-  DB.teamChat = DB.teamChat || {};
-  DB.teamChat[licenseKey] = DB.teamChat[licenseKey] || [];
-  const clientId = String(req.body?.clientId || '').slice(0, 120);
-  if (clientId) {
-    const existing = DB.teamChat[licenseKey].find(m => m.clientId === clientId);
-    if (existing) return res.json({ ok: true, message: existing, duplicate: true });
-  }
-  const message = {
-    id: newId(),
-    clientId: clientId || undefined,
-    room: licenseKey,
-    author: String(req.get('x-user-name') || 'Staff').slice(0, 60),
-    authorEmail: String(req.get('x-user-email') || '').slice(0, 100),
-    text,
-    at: new Date().toISOString()
-  };
-  DB.teamChat[licenseKey].push(message);
-  saveDB();
-  res.json({ ok: true, message });
 });
 app.get('/api/collab/:licenseKey/comments/:recordType/:recordId', (req, res) => {
   const licenseKey = requireActivatedDevice(req, res);
