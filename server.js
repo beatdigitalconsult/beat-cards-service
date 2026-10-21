@@ -46,7 +46,7 @@ app.use(express.json({ limit: '6mb' }));
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, x-license-key, x-admin-key');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, x-license-key, x-device-id, x-admin-key, x-secret-key');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -93,6 +93,8 @@ app.use(publicLimiter);
 // CONFIG
 // ---------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
+const HUBTEL_CALLBACK_TOKEN = process.env.HUBTEL_CALLBACK_TOKEN || '';
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
 // If ADMIN_KEY isn't set in the environment, generate a strong random
 // one instead of falling back to a fixed, guessable string. This
 // closes the "forgot to set it" hole — a fixed default left in place
@@ -280,7 +282,35 @@ const CARD_THEMES = {
 
 function esc(s) {
   return (s == null ? '' : String(s))
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// Values embedded in inline scripts must be encoded as JavaScript data,
+// not interpolated as source text. Escaping HTML-significant characters
+// also prevents a value from terminating its containing <script> element.
+function scriptJson(value) {
+  return JSON.stringify(value == null ? '' : value).replace(/[<>&\u2028\u2029]/g, ch => ({
+    '<': '\\u003c', '>': '\\u003e', '&': '\\u0026',
+    '\u2028': '\\u2028', '\u2029': '\\u2029'
+  })[ch]);
+}
+
+function safeHttpUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : '';
+  } catch {
+    return '';
+  }
+}
+
+function safeImageSource(value) {
+  const source = String(value || '');
+  if (/^data:image\/(?:png|jpe?g|webp|gif);base64,[a-z0-9+/]+=*$/i.test(source) && source.length <= 2_000_000) {
+    return source;
+  }
+  return safeHttpUrl(source);
 }
 
 function requireAdmin(req, res, next) {
@@ -358,7 +388,8 @@ function validateCardPayload(card) {
 }
 
 app.post('/api/cards', (req, res) => {
-  const licenseKey = req.get('x-license-key') || 'UNKNOWN';
+  const licenseKey = requireActivatedDevice(req, res);
+  if (!licenseKey) return;
   if (!isPackageEnabled(licenseKey)) {
     return res.status(403).json({ ok: false, error: 'Digital Business Card package is not active for this license. Ask Beat Digital Consult (or your account admin) to approve it.' });
   }
@@ -388,7 +419,8 @@ app.post('/api/cards', (req, res) => {
 });
 
 app.delete('/api/cards/:id', (req, res) => {
-  const licenseKey = req.get('x-license-key') || 'UNKNOWN';
+  const licenseKey = requireActivatedDevice(req, res);
+  if (!licenseKey) return;
   const c = DB.cards[req.params.id];
   if (c && c.licenseKey === licenseKey) { delete DB.cards[req.params.id]; saveDB(); }
   res.json({ ok: true });
@@ -396,14 +428,57 @@ app.delete('/api/cards/:id', (req, res) => {
 
 app.get('/api/cards/:id', (req, res) => {
   const c = DB.cards[req.params.id];
-  if (!c) return res.status(404).json({ ok: false, error: 'Not found' });
-  res.json({ ok: true, card: c });
+  // Never allow this JSON endpoint to bypass the privacy check made by
+  // the public profile route. Return an explicit public-field projection,
+  // not the stored object, so private/unknown fields and the license key
+  // can never escape through this endpoint.
+  if (!c || c.privacy === 'private') return res.status(404).json({ ok: false, error: 'Not found' });
+  const publicCard = {
+    id: String(req.params.id || '').slice(0, 160),
+    privacy: c.privacy || 'public',
+    firstName: String(c.firstName || '').slice(0, 100),
+    lastName: String(c.lastName || '').slice(0, 100),
+    fullName: String(c.fullName || '').slice(0, 200),
+    company: String(c.company || '').slice(0, 200),
+    department: String(c.department || '').slice(0, 100),
+    jobTitle: String(c.jobTitle || '').slice(0, 120),
+    phones: (Array.isArray(c.phones) ? c.phones : []).slice(0, 10)
+      .filter(p => p && p.number).map(p => ({ type: String(p.type || 'Phone').slice(0, 40), number: String(p.number).slice(0, 60) })),
+    emails: (Array.isArray(c.emails) ? c.emails : []).filter(Boolean).slice(0, 10).map(e => String(e).slice(0, 200)),
+    website: safeHttpUrl(c.website),
+    address: String(c.address || '').slice(0, 500),
+    bio: String(c.bio || '').slice(0, 2000),
+    photoUrl: safeImageSource(c.photoUrl),
+    logoUrl: safeImageSource(c.logoUrl),
+    theme: Object.prototype.hasOwnProperty.call(CARD_THEMES, c.theme) ? c.theme : 'navy',
+    socials: {
+      linkedin: safeHttpUrl(c.socials?.linkedin),
+      instagram: safeHttpUrl(c.socials?.instagram),
+      facebook: safeHttpUrl(c.socials?.facebook),
+      twitter: safeHttpUrl(c.socials?.twitter),
+      tiktok: safeHttpUrl(c.socials?.tiktok),
+      whatsapp: String(c.socials?.whatsapp || '').replace(/[^0-9]/g, '').slice(0, 30)
+    },
+    idBadge: c.idBadge ? {
+      status: c.idBadge.status === 'verified' ? 'verified' : 'unverified',
+      idNumber: String(c.idBadge.idNumber || '').slice(0, 80),
+      department: String(c.idBadge.department || '').slice(0, 100),
+      issuedDate: String(c.idBadge.issuedDate || '').slice(0, 40),
+      validUntil: String(c.idBadge.validUntil || '').slice(0, 40)
+    } : null,
+    stats: {
+      views: Number.isFinite(Number(c.stats?.views)) ? Number(c.stats.views) : 0,
+      saves: Number.isFinite(Number(c.stats?.saves)) ? Number(c.stats.saves) : 0,
+      shares: Number.isFinite(Number(c.stats?.shares)) ? Number(c.stats.shares) : 0
+    }
+  };
+  res.json({ ok: true, card: publicCard });
 });
 
 // Client-side "beacon" call for save/share button clicks on the profile page
 app.post('/api/cards/:id/track', (req, res) => {
   const c = DB.cards[req.params.id];
-  if (!c) return res.status(404).json({ ok: false });
+  if (!c || c.privacy === 'private') return res.status(404).json({ ok: false });
   const type = ['views', 'saves', 'shares'].includes(req.body?.type) ? req.body.type : null;
   if (type) { c.stats[type] = (c.stats[type] || 0) + 1; saveDB(); }
   res.json({ ok: true, stats: c.stats });
@@ -436,15 +511,16 @@ app.get('/c/:id', (req, res) => {
 
 app.get('/vcf/:id', (req, res) => {
   const card = DB.cards[req.params.id];
-  if (!card) return res.status(404).send('Not found');
+  if (!card || card.privacy === 'private') return res.status(404).send('Not found');
   if (!isPackageEnabled(card.licenseKey)) {
     return res.status(403).send(suspendedPage());
   }
   card.stats.saves = (card.stats.saves || 0) + 1;
   saveDB();
   const name = (card.fullName || `${card.firstName || ''} ${card.lastName || ''}`).trim() || 'contact';
+  const safeFilename = name.replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 80) || 'contact';
   res.set('Content-Type', 'text/vcard');
-  res.set('Content-Disposition', `attachment; filename="${name.replace(/\s+/g, '_')}.vcf"`);
+  res.set('Content-Disposition', `attachment; filename="${safeFilename}.vcf"`);
   res.send(buildVCard(card));
 });
 
@@ -474,25 +550,30 @@ function renderProfilePage(card, req) {
   const th = CARD_THEMES[card.theme] || CARD_THEMES.navy;
   const name = card.fullName || `${card.firstName || ''} ${card.lastName || ''}`.trim() || 'Contact';
   const base = `${req.protocol}://${req.get('host')}`;
+  const profileIdJson = scriptJson(card.id);
+  const baseJson = scriptJson(base);
+  const photoUrl = safeImageSource(card.photoUrl);
+  const logoUrl = safeImageSource(card.logoUrl);
+  const website = safeHttpUrl(card.website);
   const phones = (card.phones || []).filter(p => p.number);
   const emails = (card.emails || []).filter(Boolean);
   const socials = [
-    card.socials?.linkedin && ['LinkedIn', '🔗', card.socials.linkedin],
-    card.socials?.instagram && ['Instagram', '📷', card.socials.instagram],
-    card.socials?.facebook && ['Facebook', '📘', card.socials.facebook],
-    card.socials?.twitter && ['X / Twitter', '✖️', card.socials.twitter],
+    card.socials?.linkedin && ['LinkedIn', '🔗', safeHttpUrl(card.socials.linkedin)],
+    card.socials?.instagram && ['Instagram', '📷', safeHttpUrl(card.socials.instagram)],
+    card.socials?.facebook && ['Facebook', '📘', safeHttpUrl(card.socials.facebook)],
+    card.socials?.twitter && ['X / Twitter', '✖️', safeHttpUrl(card.socials.twitter)],
     card.socials?.whatsapp && ['WhatsApp', '💬', 'https://wa.me/' + card.socials.whatsapp.replace(/[^0-9]/g, '')],
-    card.socials?.tiktok && ['TikTok', '🎵', card.socials.tiktok]
-  ].filter(Boolean);
+    card.socials?.tiktok && ['TikTok', '🎵', safeHttpUrl(card.socials.tiktok)]
+  ].filter(row => row && row[2]);
 
   const rows = [];
   phones.forEach((p, i) => rows.push(`<a class="row" href="tel:${esc(p.number)}"><div class="ic">📞</div><div><div class="lbl">${esc(p.type || 'Phone')}</div><div class="val">${esc(p.number)}</div></div></a>`));
   emails.forEach(e => rows.push(`<a class="row" href="mailto:${esc(e)}"><div class="ic">✉️</div><div><div class="lbl">Email</div><div class="val">${esc(e)}</div></div></a>`));
-  if (card.website) rows.push(`<a class="row" target="_blank" rel="noopener" href="${esc(card.website)}"><div class="ic">🌐</div><div><div class="lbl">Website</div><div class="val">${esc(card.website)}</div></div></a>`);
+  if (website) rows.push(`<a class="row" target="_blank" rel="noopener" href="${esc(website)}"><div class="ic">🌐</div><div><div class="lbl">Website</div><div class="val">${esc(website)}</div></div></a>`);
   if (card.address) rows.push(`<div class="row"><div class="ic">📍</div><div><div class="lbl">Address</div><div class="val">${esc(card.address)}</div></div></div>`);
   socials.forEach(([label, icon, url]) => rows.push(`<a class="row" target="_blank" rel="noopener" href="${esc(url)}"><div class="ic">${icon}</div><div><div class="lbl">${esc(label)}</div><div class="val">${esc(url)}</div></div></a>`));
 
-  const waLink = card.socials?.whatsapp ? `https://wa.me/${card.socials.whatsapp.replace(/[^0-9]/g, '')}` : '';
+  const waLink = card.socials?.whatsapp ? safeHttpUrl(`https://wa.me/${card.socials.whatsapp.replace(/[^0-9]/g, '')}`) : '';
   const firstPhone = phones[0]?.number || '';
 
   // ── Employee ID verification panel ──
@@ -525,7 +606,7 @@ function renderProfilePage(card, req) {
 <title>${esc(name)} — ${badge ? 'Employee Verification' : 'Digital Business Card'}</title>
 <meta property="og:title" content="${esc(name)}${card.company ? ' · ' + esc(card.company) : ''}">
 <meta property="og:description" content="${esc(card.jobTitle || (badge ? 'Employee ID Verification' : 'Digital Business Card'))}">
-${card.photoUrl ? `<meta property="og:image" content="${esc(card.photoUrl)}">` : ''}
+  ${photoUrl ? `<meta property="og:image" content="${esc(photoUrl)}">` : ''}
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:Segoe UI,Arial,sans-serif;background:#f2f3f8;display:flex;justify-content:center;padding:26px 14px;min-height:100vh}
@@ -558,8 +639,8 @@ body{font-family:Segoe UI,Arial,sans-serif;background:#f2f3f8;display:flex;justi
 .foot a{color:#888}
 </style></head><body><div class="wrap">
 <div class="hero">
-  ${card.logoUrl ? `<img src="${esc(card.logoUrl)}" style="position:absolute;top:14px;right:14px;width:38px;height:38px;object-fit:contain;background:#fff;border-radius:8px;padding:3px">` : ''}
-  ${card.photoUrl ? `<img class="photo" src="${esc(card.photoUrl)}">` : `<div class="photo ph-fallback">${esc(name.substring(0, 2).toUpperCase())}</div>`}
+  ${logoUrl ? `<img src="${esc(logoUrl)}" style="position:absolute;top:14px;right:14px;width:38px;height:38px;object-fit:contain;background:#fff;border-radius:8px;padding:3px">` : ''}
+  ${photoUrl ? `<img class="photo" src="${esc(photoUrl)}">` : `<div class="photo ph-fallback">${esc(name.substring(0, 2).toUpperCase())}</div>`}
   <div class="name">${esc(name)}</div>
   ${card.jobTitle ? `<div class="title">${esc(card.jobTitle)}</div>` : ''}
   ${card.company ? `<div class="company">${esc(card.company)}</div>` : ''}
@@ -581,8 +662,8 @@ body{font-family:Segoe UI,Arial,sans-serif;background:#f2f3f8;display:flex;justi
 <div class="foot">${badge ? 'Employee Verification' : 'Digital Business Card'} by ${BRAND.company} · "${BRAND.tagline}"<br><a href="${BRAND.site}" target="_blank" rel="noopener">${BRAND.site.replace('https://', '')}</a></div>
 </div>
 <script>
-function track(type){ try{ fetch('${base}/api/cards/${card.id}/track',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:type})}); }catch(e){} }
-function saveContact(){ track('saves'); window.location.href = '${base}/vcf/${card.id}'; }
+function track(type){ try{ fetch(${baseJson}+'/api/cards/'+encodeURIComponent(${profileIdJson})+'/track',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({type:type})}); }catch(e){} }
+function saveContact(){ track('saves'); window.location.href = ${baseJson}+'/vcf/'+encodeURIComponent(${profileIdJson}); }
 </script>
 </body></html>`;
 }
@@ -850,6 +931,7 @@ const aiLimiter = makeRateLimiter({ windowMs: 60 * 1000, max: 8 }); // generatio
 app.use('/api/ai', aiLimiter);
 
 app.post('/api/ai/proposal', async (req, res) => {
+  if (!requireActivatedDevice(req, res)) return;
   if (!ANTHROPIC_API_KEY) {
     return res.status(503).json({ ok: false, error: 'AI proposal generation is not configured on this server yet. The site owner needs to set the ANTHROPIC_API_KEY environment variable — see README-DEPLOY.md.' });
   }
@@ -927,6 +1009,7 @@ const emailLimiter = makeRateLimiter({ windowMs: 60 * 1000, max: 20 });
 app.use('/api/email', emailLimiter);
 
 app.post('/api/email/send', async (req, res) => {
+  if (!requireActivatedDevice(req, res)) return;
   const { provider, smtp, sendgridApiKey, from, fromName, to, subject, text, html } = req.body || {};
   if (!to || !subject || !(text || html)) {
     return res.status(400).json({ ok: false, error: 'to, subject and text/html are required.' });
@@ -989,6 +1072,7 @@ app.use('/api/payments', payLimiter);
 
 // ── Paystack ──
 app.post('/api/payments/paystack/initialize', async (req, res) => {
+  if (!requireActivatedDevice(req, res)) return;
   const { secretKey, email, amount, currency = 'GHS', reference, callbackUrl } = req.body || {};
   if (!secretKey || !email || !amount || !reference) return res.status(400).json({ ok: false, error: 'secretKey, email, amount and reference are required.' });
   try {
@@ -1003,6 +1087,7 @@ app.post('/api/payments/paystack/initialize', async (req, res) => {
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 app.get('/api/payments/paystack/verify/:reference', async (req, res) => {
+  if (!requireActivatedDevice(req, res)) return;
   const secretKey = req.get('x-secret-key');
   if (!secretKey) return res.status(400).json({ ok: false, error: 'x-secret-key header required.' });
   try {
@@ -1017,11 +1102,17 @@ app.get('/api/payments/paystack/verify/:reference', async (req, res) => {
 
 // ── Hubtel Online Checkout ──
 app.post('/api/payments/hubtel/initiate', async (req, res) => {
-  const { clientId, clientSecret, merchantAccountNumber, amount, description, clientReference, callbackUrl, returnUrl, cancellationUrl } = req.body || {};
+  if (!requireActivatedDevice(req, res)) return;
+  const { clientId, clientSecret, merchantAccountNumber, amount, description, clientReference, returnUrl, cancellationUrl } = req.body || {};
   if (!clientId || !clientSecret || !merchantAccountNumber || !amount || !clientReference) {
     return res.status(400).json({ ok: false, error: 'clientId, clientSecret, merchantAccountNumber, amount and clientReference are required.' });
   }
+  if (!HUBTEL_CALLBACK_TOKEN || !/^https:\/\//i.test(PUBLIC_BASE_URL)) {
+    return res.status(503).json({ ok: false, error: 'Hubtel callbacks are not configured securely on this service.' });
+  }
   try {
+    const secureCallback = new URL('/api/payments/hubtel/callback', PUBLIC_BASE_URL);
+    secureCallback.searchParams.set('token', HUBTEL_CALLBACK_TOKEN);
     const auth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
     const r = await fetch('https://payproxyapi.hubtel.com/items/initiate', {
       method: 'POST',
@@ -1029,7 +1120,7 @@ app.post('/api/payments/hubtel/initiate', async (req, res) => {
       body: JSON.stringify({
         totalAmount: amount,
         description: description || 'Invoice payment',
-        callbackUrl, returnUrl, cancellationUrl,
+        callbackUrl: secureCallback.toString(), returnUrl, cancellationUrl,
         merchantAccountNumber, clientReference
       })
     });
@@ -1039,25 +1130,38 @@ app.post('/api/payments/hubtel/initiate', async (req, res) => {
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 // Hubtel posts a server-to-server callback here once the customer completes
-// (or abandons) payment. We stash the last-known status per clientReference
-// so the BMS app can poll GET /status/:reference from the browser.
+// (or abandons) payment. Require a deployment-specific bearer token and keep
+// only status fields; unauthenticated request bodies are never treated as
+// evidence that a payment succeeded.
 app.post('/api/payments/hubtel/callback', (req, res) => {
+  if (!HUBTEL_CALLBACK_TOKEN) return res.status(503).json({ ok: false, error: 'Callback verification is not configured.' });
+  const supplied = Buffer.from(String(req.query.token || ''), 'utf8');
+  const expected = Buffer.from(HUBTEL_CALLBACK_TOKEN, 'utf8');
+  if (supplied.length !== expected.length || !crypto.timingSafeEqual(supplied, expected)) {
+    return res.status(401).json({ ok: false, error: 'Invalid callback token.' });
+  }
   const body = req.body || {};
   const ref = body.ClientReference || body.clientReference || body.Data?.ClientReference;
   if (ref) {
     DB.hubtelStatus = DB.hubtelStatus || {};
-    DB.hubtelStatus[ref] = { ...body, receivedAt: new Date().toISOString() };
+    DB.hubtelStatus[ref] = {
+      reference: String(ref).slice(0, 160),
+      responseCode: String(body.ResponseCode || body.responseCode || body.Data?.ResponseCode || '').slice(0, 40),
+      status: String(body.Status || body.status || body.Data?.Status || '').slice(0, 80),
+      receivedAt: new Date().toISOString()
+    };
     saveDB();
   }
   res.sendStatus(200);
 });
-app.get('/api/payments/hubtel/status/:reference', (req, res) => {
+app.get('/api/payments/hubtel/status/:reference', requireAdmin, (req, res) => {
   const rec = (DB.hubtelStatus || {})[req.params.reference];
   res.json({ ok: true, found: !!rec, status: rec || null });
 });
 
 // ── ExpressPay Ghana (Dynamic Invoice API) ──
 app.post('/api/payments/expresspay/initiate', async (req, res) => {
+  if (!requireActivatedDevice(req, res)) return;
   const { merchantId, apiKey, amount, accountNumber, merchantReference, description, redirectUrl, postUrl, sandbox } = req.body || {};
   if (!merchantId || !apiKey || !amount || !merchantReference) {
     return res.status(400).json({ ok: false, error: 'merchantId, apiKey, amount and merchantReference are required.' });
@@ -1089,10 +1193,15 @@ app.post('/api/payments/expresspay/initiate', async (req, res) => {
 // this app is designed to keep working fully offline.
 // =====================================================================
 app.post('/api/audit', (req, res) => {
-  const { licenseKey, actor, action, details } = req.body || {};
-  if (!licenseKey || !action) return res.status(400).json({ ok: false, error: 'licenseKey and action are required.' });
+  const licenseKey = requireActivatedDevice(req, res);
+  if (!licenseKey) return;
+  const { actor, action } = req.body || {};
+  if (!action || String(action).length > 120) return res.status(400).json({ ok: false, error: 'A valid action is required.' });
   DB.businessAuditLog = DB.businessAuditLog || [];
-  DB.businessAuditLog.unshift({ at: new Date().toISOString(), licenseKey, actor: actor || 'unknown', action, details: details || null });
+  DB.businessAuditLog.unshift({
+    at: new Date().toISOString(), licenseKey,
+    actor: String(actor || 'unknown').slice(0, 100), action: String(action)
+  });
   DB.businessAuditLog = DB.businessAuditLog.slice(0, 5000);
   saveDB();
   res.json({ ok: true });
@@ -1111,7 +1220,8 @@ app.get('/api/admin/business-audit-log', requireAdmin, (req, res) => {
 // owns what it publishes, nothing else is ever exposed.
 // =====================================================================
 app.post('/api/portal/publish', (req, res) => {
-  const licenseKey = req.get('x-license-key') || 'UNKNOWN';
+  const licenseKey = requireActivatedDevice(req, res);
+  if (!licenseKey) return;
   const snapshot = req.body || {};
   if (!snapshot.invoiceId || !snapshot.total) return res.status(400).json({ ok: false, error: 'invoiceId and total are required.' });
   const id = snapshot.publicId && DB.portals[snapshot.publicId]?.licenseKey === licenseKey ? snapshot.publicId : newId();
@@ -1123,33 +1233,47 @@ app.post('/api/portal/publish', (req, res) => {
 app.get('/portal/:id', (req, res) => {
   const p = DB.portals[req.params.id];
   if (!p) return res.status(404).send(notFoundPage());
+  const asAmount = value => {
+    const amount = Number(value);
+    return Number.isFinite(amount) && amount >= 0 ? amount : 0;
+  };
+  const invoiceId = esc(p.invoiceId);
+  const businessName = esc(p.businessName || 'Invoice');
+  const clientName = esc(p.clientName || '');
+  const currencySymbol = esc(p.currencySymbol || '₵');
+  const total = asAmount(p.total);
+  const balance = asAmount(p.balance);
   const paidBadge = p.status === 'paid' ? '<span style="background:#16a34a;color:#fff;padding:4px 12px;border-radius:20px;font-size:13px">✅ Paid</span>'
-    : `<span style="background:#f59e0b;color:#fff;padding:4px 12px;border-radius:20px;font-size:13px">⏳ ${p.status||'Awaiting Payment'}</span>`;
-  const itemsHtml = (p.items || []).map(it => `<tr><td style="padding:8px 0;border-bottom:1px solid #eee">${it.desc||it.description||''}</td><td style="padding:8px 0;border-bottom:1px solid #eee;text-align:right">${p.currencySymbol||'₵'}${(it.total||it.amount||0).toLocaleString()}</td></tr>`).join('');
-  const payButtons = (p.balance > 0 && p.paystackPublicKey) ? `
-    <button onclick="payWithPaystack()" style="background:#0ea5e9;color:#fff;border:none;padding:12px 24px;border-radius:8px;font-size:15px;cursor:pointer;margin-top:16px">💳 Pay Now — ${p.currencySymbol||'₵'}${p.balance.toLocaleString()}</button>
+    : `<span style="background:#f59e0b;color:#fff;padding:4px 12px;border-radius:20px;font-size:13px">⏳ ${esc(p.status || 'Awaiting Payment')}</span>`;
+  const itemsHtml = (Array.isArray(p.items) ? p.items : []).map(it => {
+    const description = esc(it?.desc || it?.description || '');
+    const amount = asAmount(it?.total ?? it?.amount);
+    return `<tr><td style="padding:8px 0;border-bottom:1px solid #eee">${description}</td><td style="padding:8px 0;border-bottom:1px solid #eee;text-align:right">${currencySymbol}${amount.toLocaleString()}</td></tr>`;
+  }).join('');
+  const payButtons = (balance > 0 && p.paystackPublicKey) ? `
+    <button onclick="payWithPaystack()" style="background:#0ea5e9;color:#fff;border:none;padding:12px 24px;border-radius:8px;font-size:15px;cursor:pointer;margin-top:16px">💳 Pay Now — ${currencySymbol}${balance.toLocaleString()}</button>
     <script src="https://js.paystack.co/v1/inline.js"></script>
     <script>
       function payWithPaystack(){
         const handler = PaystackPop.setup({
-          key: '${p.paystackPublicKey}', email: '${(p.clientEmail||'customer@example.com').replace(/'/g,"")}',
-          amount: ${Math.round((p.balance||0)*100)}, currency: '${p.currency||'GHS'}',
-          ref: 'PORTAL-${p.invoiceId}-'+Date.now(),
-          callback: function(r){ fetch('/api/payments/paystack/verify/'+r.reference).then(x=>x.json()).then(()=>{ alert('Payment received — thank you!'); location.reload(); }); },
+          key: ${scriptJson(p.paystackPublicKey)}, email: ${scriptJson(p.clientEmail || 'customer@example.com')},
+          amount: ${Math.round(balance * 100)}, currency: ${scriptJson(p.currency || 'GHS')},
+          ref: 'PORTAL-' + ${scriptJson(p.invoiceId)} + '-' + Date.now(),
+          callback: function(){ alert('Payment submitted. Please wait for the merchant to confirm it.'); },
           onClose: function(){}
         });
         handler.openIframe();
       }
     </script>` : '';
   res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>Invoice ${p.invoiceId} — ${p.businessName||''}</title>
+    <title>Invoice ${invoiceId} — ${businessName}</title>
     <style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#f8fafc;margin:0;padding:24px}
     .card{max-width:560px;margin:0 auto;background:#fff;border-radius:14px;padding:28px;box-shadow:0 4px 20px rgba(0,0,0,.06)}
     h1{font-size:20px;margin:0 0 4px}.muted{color:#64748b;font-size:13px}table{width:100%;border-collapse:collapse;margin-top:16px}</style></head>
     <body><div class="card">
-      <h1>${p.businessName||'Invoice'}</h1><div class="muted">Invoice ${p.invoiceId} · ${p.clientName||''}</div>
+      <h1>${businessName}</h1><div class="muted">Invoice ${invoiceId} · ${clientName}</div>
       <div style="margin-top:12px">${paidBadge}</div>
-      <table>${itemsHtml}<tr><td style="padding-top:12px;font-weight:700">Total</td><td style="padding-top:12px;font-weight:700;text-align:right">${p.currencySymbol||'₵'}${(p.total||0).toLocaleString()}</td></tr></table>
+      <table>${itemsHtml}<tr><td style="padding-top:12px;font-weight:700">Total</td><td style="padding-top:12px;font-weight:700;text-align:right">${currencySymbol}${total.toLocaleString()}</td></tr></table>
       ${payButtons}
       <div class="muted" style="margin-top:20px">Powered by BMS — Beat Digital Consult</div>
     </div></body></html>`);
@@ -1161,9 +1285,14 @@ app.get('/portal/:id', (req, res) => {
 // into their own local BMS via the sync endpoint below.
 // =====================================================================
 app.post('/api/survey/publish', (req, res) => {
-  const licenseKey = req.get('x-license-key') || 'UNKNOWN';
+  const licenseKey = requireActivatedDevice(req, res);
+  if (!licenseKey) return;
   const { id, title, question } = req.body || {};
   if (!id || !question) return res.status(400).json({ ok: false, error: 'id and question are required.' });
+  const existing = DB.surveys[id];
+  if (existing && existing.licenseKey !== licenseKey) {
+    return res.status(403).json({ ok: false, error: 'This survey belongs to another license.' });
+  }
   DB.surveys[id] = { id, title, question, licenseKey, publishedAt: new Date().toISOString() };
   saveDB();
   const base = `${req.protocol}://${req.get('host')}`;
@@ -1173,8 +1302,10 @@ app.get('/survey/:id', (req, res) => {
   const s = DB.surveys[req.params.id];
   if (!s) return res.status(404).send(notFoundPage());
   const clientName = (req.query.client || '').toString().slice(0, 100);
+  const surveyIdJson = scriptJson(req.params.id);
+  const clientNameJson = scriptJson(clientName);
   res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>${s.title||'Quick Survey'}</title>
+    <title>${esc(s.title || 'Quick Survey')}</title>
     <style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#f8fafc;margin:0;padding:24px}
     .card{max-width:520px;margin:0 auto;background:#fff;border-radius:14px;padding:28px;box-shadow:0 4px 20px rgba(0,0,0,.06)}
     .scale{display:flex;gap:6px;flex-wrap:wrap;margin:16px 0}.scale button{width:38px;height:38px;border-radius:8px;border:1px solid #e2e8f0;background:#fff;cursor:pointer;font-weight:600}
@@ -1182,7 +1313,7 @@ app.get('/survey/:id', (req, res) => {
     textarea{width:100%;border:1px solid #e2e8f0;border-radius:8px;padding:10px;font-family:inherit;margin-top:10px}
     button.submit{background:#16a34a;color:#fff;border:none;padding:12px 24px;border-radius:8px;font-size:15px;cursor:pointer;margin-top:14px}</style></head>
     <body><div class="card">
-      <h2>${s.title||'Quick Survey'}</h2><p>${s.question}</p>
+      <h2>${esc(s.title || 'Quick Survey')}</h2><p>${esc(s.question)}</p>
       <div class="scale" id="scale">${Array.from({length:11},(_,i)=>`<button onclick="pick(${i})" data-v="${i}">${i}</button>`).join('')}</div>
       <textarea id="comment" placeholder="Anything you'd like to add? (optional)" rows="3"></textarea>
       <div><button class="submit" onclick="submitResponse()">Submit</button></div>
@@ -1193,9 +1324,9 @@ app.get('/survey/:id', (req, res) => {
       function pick(v){ rating=v; document.querySelectorAll('#scale button').forEach(b=>b.classList.toggle('sel', +b.dataset.v===v)); }
       function submitResponse(){
         if (rating===null) return alert('Please select a rating from 0-10');
-        fetch('/api/survey/${req.params.id}/respond', { method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({ clientName: '${clientName.replace(/'/g,"")}', rating, comment: document.getElementById('comment').value })
-        }).then(()=>{ document.querySelector('.card').innerHTML=''; document.getElementById('thanks').style.display='block'; document.querySelector('.card').appendChild(document.getElementById('thanks')); });
+        fetch('/api/survey/' + encodeURIComponent(${surveyIdJson}) + '/respond', { method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ clientName: ${clientNameJson}, rating, comment: document.getElementById('comment').value })
+        }).then(r=>{ if(!r.ok) throw new Error('Unable to submit response'); return r.json(); }).then(()=>{ document.querySelector('.card').innerHTML=''; document.getElementById('thanks').style.display='block'; document.querySelector('.card').appendChild(document.getElementById('thanks')); }).catch(()=>alert('Could not submit your response. Please try again.'));
       }
     </script>
     </body></html>`);
@@ -1204,8 +1335,16 @@ app.post('/api/survey/:id/respond', (req, res) => {
   const s = DB.surveys[req.params.id];
   if (!s) return res.status(404).json({ ok: false });
   const { clientName, rating, comment } = req.body || {};
+  const parsedRating = Number(rating);
+  if (!Number.isInteger(parsedRating) || parsedRating < 0 || parsedRating > 10) {
+    return res.status(400).json({ ok: false, error: 'Rating must be an integer from 0 to 10.' });
+  }
   DB.surveyResponses[req.params.id] = DB.surveyResponses[req.params.id] || [];
-  DB.surveyResponses[req.params.id].push({ id: newId(), clientName: (clientName||'').slice(0,100), rating: parseInt(rating), comment: (comment||'').slice(0,1000), at: new Date().toISOString() });
+  DB.surveyResponses[req.params.id].push({
+    id: newId(), clientName: String(clientName || '').slice(0, 100),
+    rating: parsedRating, comment: String(comment || '').slice(0, 1000),
+    at: new Date().toISOString()
+  });
   saveDB();
   res.json({ ok: true });
 });
@@ -1213,7 +1352,8 @@ app.post('/api/survey/:id/respond', (req, res) => {
 // back into local storage — never the other way around, so the tenant
 // always keeps their own copy of the data.
 app.get('/api/survey/:id/responses', (req, res) => {
-  const licenseKey = req.get('x-license-key') || 'UNKNOWN';
+  const licenseKey = requireActivatedDevice(req, res);
+  if (!licenseKey) return;
   const s = DB.surveys[req.params.id];
   if (!s || s.licenseKey !== licenseKey) return res.status(403).json({ ok: false, error: 'Not your survey.' });
   res.json({ ok: true, responses: DB.surveyResponses[req.params.id] || [] });
@@ -1250,6 +1390,7 @@ app.get('/api/updates/latest', (req, res) => {
 // travel with each request from the tenant's own Settings.
 // =====================================================================
 app.post('/api/sms/send', async (req, res) => {
+  if (!requireActivatedDevice(req, res)) return;
   const { provider, apiKey, senderId, clientId, clientSecret, to, message } = req.body || {};
   if (!provider || provider === 'none') return res.status(400).json({ ok: false, error: 'No SMS provider configured.' });
   if (!to || !message) return res.status(400).json({ ok: false, error: 'to and message are required.' });
