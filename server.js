@@ -46,7 +46,7 @@ app.use(express.json({ limit: '6mb' }));
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, x-license-key, x-device-id, x-admin-key, x-secret-key');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-license-key, x-device-id, x-admin-key, x-secret-key');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -86,6 +86,7 @@ function makeRateLimiter({ windowMs, max }) {
 // endpoints where hits should be rare and deliberate.
 const publicLimiter = makeRateLimiter({ windowMs: 60 * 1000, max: 120 });
 const adminLimiter = makeRateLimiter({ windowMs: 60 * 1000, max: 30 });
+const mobilePairLimiter = makeRateLimiter({ windowMs: 60 * 1000, max: 8 });
 app.use('/api/admin', adminLimiter);
 app.use(publicLimiter);
 
@@ -225,24 +226,24 @@ async function loadDB() {
   if (mongoCollection) {
     try {
       const doc = await mongoCollection.findOne({ _id: 'db' });
-      if (doc) return { cards: doc.cards || {}, packages: doc.packages || {}, auditLog: doc.auditLog || [], licenses: doc.licenses || {}, hubtelStatus: doc.hubtelStatus || {}, businessAuditLog: doc.businessAuditLog || [], portals: doc.portals || {}, surveys: doc.surveys || {}, surveyResponses: doc.surveyResponses || {}, teamChat: doc.teamChat || {}, recordComments: doc.recordComments || {}, publicApiData: doc.publicApiData || {}, updates: doc.updates || [], adminKey: doc.adminKey || '' };
-      return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {}, publicApiData: {}, updates: [], adminKey: '' };
+      if (doc) return { cards: doc.cards || {}, packages: doc.packages || {}, auditLog: doc.auditLog || [], licenses: doc.licenses || {}, hubtelStatus: doc.hubtelStatus || {}, businessAuditLog: doc.businessAuditLog || [], portals: doc.portals || {}, surveys: doc.surveys || {}, surveyResponses: doc.surveyResponses || {}, teamChat: doc.teamChat || {}, recordComments: doc.recordComments || {}, publicApiData: doc.publicApiData || {}, updates: doc.updates || [], adminKey: doc.adminKey || '', mobilePairings: doc.mobilePairings || {}, mobileSessions: doc.mobileSessions || {}, mobilePayments: doc.mobilePayments || [] };
+      return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {}, publicApiData: {}, updates: [], adminKey: '', mobilePairings: {}, mobileSessions: {}, mobilePayments: [] };
     } catch (e) {
       console.error('MongoDB load error, falling back to local file for this boot:', e.message);
     }
   }
   try {
-    if (!fs.existsSync(DB_PATH)) return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {}, publicApiData: {}, updates: [], adminKey: '' };
+    if (!fs.existsSync(DB_PATH)) return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {}, publicApiData: {}, updates: [], adminKey: '', mobilePairings: {}, mobileSessions: {}, mobilePayments: [] };
     const raw = fs.readFileSync(DB_PATH, 'utf8');
     const parsed = JSON.parse(raw || '{}');
-    return { cards: parsed.cards || {}, packages: parsed.packages || {}, auditLog: parsed.auditLog || [], licenses: parsed.licenses || {}, hubtelStatus: parsed.hubtelStatus || {}, businessAuditLog: parsed.businessAuditLog || [], portals: parsed.portals || {}, surveys: parsed.surveys || {}, surveyResponses: parsed.surveyResponses || {}, teamChat: parsed.teamChat || {}, recordComments: parsed.recordComments || {}, publicApiData: parsed.publicApiData || {}, updates: parsed.updates || [], adminKey: parsed.adminKey || '' };
+    return { cards: parsed.cards || {}, packages: parsed.packages || {}, auditLog: parsed.auditLog || [], licenses: parsed.licenses || {}, hubtelStatus: parsed.hubtelStatus || {}, businessAuditLog: parsed.businessAuditLog || [], portals: parsed.portals || {}, surveys: parsed.surveys || {}, surveyResponses: parsed.surveyResponses || {}, teamChat: parsed.teamChat || {}, recordComments: parsed.recordComments || {}, publicApiData: parsed.publicApiData || {}, updates: parsed.updates || [], adminKey: parsed.adminKey || '', mobilePairings: parsed.mobilePairings || {}, mobileSessions: parsed.mobileSessions || {}, mobilePayments: parsed.mobilePayments || [] };
   } catch (e) {
     console.error('DB load error, starting with an empty store:', e.message);
-    return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {}, publicApiData: {}, updates: [], adminKey: '' };
+    return { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {}, publicApiData: {}, updates: [], adminKey: '', mobilePairings: {}, mobileSessions: {}, mobilePayments: [] };
   }
 }
 
-let DB = { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {}, publicApiData: {}, adminKey: '' }; // populated for real just before the server starts listening — see boot() below
+let DB = { cards: {}, packages: {}, auditLog: [], licenses: {}, hubtelStatus: {}, businessAuditLog: [], portals: {}, surveys: {}, surveyResponses: {}, teamChat: {}, recordComments: {}, publicApiData: {}, adminKey: '', mobilePairings: {}, mobileSessions: {}, mobilePayments: [] }; // populated for real just before the server starts listening — see boot() below
 let saveTimer = null;
 function saveDB() {
   clearTimeout(saveTimer);
@@ -259,7 +260,7 @@ function saveDB() {
       try {
         await mongoCollection.updateOne(
           { _id: 'db' },
-          { $set: { cards: DB.cards, packages: DB.packages, auditLog: DB.auditLog || [], licenses: DB.licenses || {}, hubtelStatus: DB.hubtelStatus || {}, businessAuditLog: DB.businessAuditLog || [], portals: DB.portals || {}, surveys: DB.surveys || {}, surveyResponses: DB.surveyResponses || {}, teamChat: DB.teamChat || {}, recordComments: DB.recordComments || {}, publicApiData: DB.publicApiData || {}, updates: DB.updates || [], adminKey: DB.adminKey || '', updatedAt: new Date() } },
+          { $set: { cards: DB.cards, packages: DB.packages, auditLog: DB.auditLog || [], licenses: DB.licenses || {}, hubtelStatus: DB.hubtelStatus || {}, businessAuditLog: DB.businessAuditLog || [], portals: DB.portals || {}, surveys: DB.surveys || {}, surveyResponses: DB.surveyResponses || {}, teamChat: DB.teamChat || {}, recordComments: DB.recordComments || {}, publicApiData: DB.publicApiData || {}, updates: DB.updates || [], adminKey: DB.adminKey || '', mobilePairings: DB.mobilePairings || {}, mobileSessions: DB.mobileSessions || {}, mobilePayments: DB.mobilePayments || [], updatedAt: new Date() } },
           { upsert: true }
         );
       } catch (e) {
@@ -319,6 +320,93 @@ function requireAdmin(req, res, next) {
     return res.status(401).json({ ok: false, error: 'Invalid or missing admin key.' });
   }
   next();
+}
+
+const MOBILE_PAIRING_TTL_MS = 10 * 60 * 1000;
+const MOBILE_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const MOBILE_PLAN_CODES = { starter: 'S', professional: 'P', enterprise: 'E', lifetime: 'L' };
+const MOBILE_PAYMENT_METHODS = new Set(['cash', 'bank_transfer', 'mobile_money', 'other']);
+
+function mobileTokenHash(value) {
+  return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function requireMobileSession(req, res, next) {
+  const header = req.get('authorization') || '';
+  const match = /^Bearer\s+([A-Za-z0-9_-]{40,})$/i.exec(header);
+  if (!match) return res.status(401).json({ ok: false, error: 'Mobile session is missing or invalid.' });
+
+  const tokenHash = mobileTokenHash(match[1]);
+  const session = DB.mobileSessions?.[tokenHash];
+  if (!session || Date.parse(session.expiresAt) <= Date.now()) {
+    if (session) {
+      delete DB.mobileSessions[tokenHash];
+      saveDB();
+    }
+    return res.status(401).json({ ok: false, error: 'Mobile session has expired. Pair this device again.' });
+  }
+
+  req.mobileSession = { tokenHash, ...session };
+  next();
+}
+
+function appendMobileAudit(action, licenseKey, req, extra = {}) {
+  DB.auditLog = DB.auditLog || [];
+  DB.auditLog.unshift({
+    at: new Date().toISOString(),
+    action,
+    licenseKey,
+    actor: req.mobileSession?.deviceLabel || 'mobile-owner',
+    ...extra
+  });
+  DB.auditLog = DB.auditLog.slice(0, 500);
+}
+
+function makeMobileLicenseKey(plan) {
+  const alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const segments = Array.from({ length: 10 }, () => {
+    let segment = '';
+    while (segment.length < 5) {
+      for (const byte of crypto.randomBytes(16)) {
+        if (byte < 252) segment += alphabet[byte % alphabet.length];
+        if (segment.length === 5) break;
+      }
+    }
+    return segment;
+  });
+  return `BDC-${MOBILE_PLAN_CODES[plan]}-${segments.join('-')}`;
+}
+
+function validateMobilePayment(input) {
+  if (!input || input.verified !== true) return 'Confirm that the offline payment was received before continuing.';
+  if (!MOBILE_PAYMENT_METHODS.has(input.method)) return 'Choose a valid offline payment method.';
+  if (!Number.isFinite(Number(input.amount)) || Number(input.amount) <= 0 || Number(input.amount) > 1000000000) return 'Enter a valid amount greater than zero.';
+  if (!/^[A-Z]{3}$/.test(String(input.currency || '').toUpperCase())) return 'Enter a three-letter currency code.';
+  if (input.reference != null && String(input.reference).length > 120) return 'Payment reference must be 120 characters or fewer.';
+  if (input.notes != null && String(input.notes).length > 500) return 'Payment notes must be 500 characters or fewer.';
+  return null;
+}
+
+function addMobilePayment(license, input, req, extendMonths = null) {
+  const payment = {
+    id: crypto.randomBytes(10).toString('hex'),
+    licenseKey: license.key,
+    businessName: license.businessName || '',
+    plan: license.plan,
+    method: input.method,
+    amount: Number(input.amount),
+    currency: String(input.currency).toUpperCase(),
+    reference: String(input.reference || '').trim(),
+    notes: String(input.notes || '').trim(),
+    verified: true,
+    recordedAt: new Date().toISOString(),
+    ...(extendMonths ? { extendMonths } : {})
+  };
+  DB.mobilePayments = DB.mobilePayments || [];
+  DB.mobilePayments.unshift(payment);
+  DB.mobilePayments = DB.mobilePayments.slice(0, 2000);
+  appendMobileAudit('mobile-payment-recorded', license.key, req, { paymentId: payment.id, amount: payment.amount, currency: payment.currency });
+  return payment;
 }
 
 function buildVCard(card) {
@@ -717,6 +805,188 @@ function licenseStatusOf(lic) {
   if (lic.expiresAt && new Date(lic.expiresAt) < new Date()) return 'expired';
   return 'active';
 }
+
+// Owner-only device pairing. The permanent ADMIN_KEY is used only by the
+// existing owner desktop app; it is never returned to or stored by the APK.
+app.post('/api/admin/mobile-pairings', requireAdmin, (req, res) => {
+  DB.mobilePairings = DB.mobilePairings || {};
+  const now = Date.now();
+  Object.entries(DB.mobilePairings).forEach(([hash, pairing]) => {
+    if (Date.parse(pairing.expiresAt) <= now) delete DB.mobilePairings[hash];
+  });
+  const code = crypto.randomBytes(8).toString('hex').toUpperCase().match(/.{4}/g).join('-');
+  const expiresAt = new Date(now + MOBILE_PAIRING_TTL_MS).toISOString();
+  DB.mobilePairings[mobileTokenHash(code.replace(/-/g, ''))] = { expiresAt, createdAt: new Date(now).toISOString() };
+  saveDB();
+  res.json({ ok: true, code, expiresAt });
+});
+
+// A pairing code is random, single-use, short-lived, IP-rate-limited, and
+// stored only as a SHA-256 hash. The returned bearer token is also stored
+// only as a hash and can be revoked by signing out on the paired device.
+app.post('/api/mobile/pair', mobilePairLimiter, (req, res) => {
+  const normalized = String(req.body?.code || '').toUpperCase().replace(/[^A-F0-9]/g, '');
+  if (!/^[A-F0-9]{16}$/.test(normalized)) {
+    return res.status(400).json({ ok: false, error: 'Enter the 16-character pairing code shown in the owner desktop app.' });
+  }
+  const codeHash = mobileTokenHash(normalized);
+  const pairing = DB.mobilePairings?.[codeHash];
+  if (!pairing || Date.parse(pairing.expiresAt) <= Date.now()) {
+    if (pairing) delete DB.mobilePairings[codeHash];
+    return res.status(400).json({ ok: false, error: 'Pairing code is invalid, expired, or already used. Generate a new code on the owner desktop.' });
+  }
+
+  delete DB.mobilePairings[codeHash];
+  const token = crypto.randomBytes(32).toString('base64url');
+  const expiresAt = new Date(Date.now() + MOBILE_SESSION_TTL_MS).toISOString();
+  const deviceLabel = String(req.body?.deviceLabel || 'BMS mobile device').trim().slice(0, 80) || 'BMS mobile device';
+  DB.mobileSessions = DB.mobileSessions || {};
+  DB.mobileSessions[mobileTokenHash(token)] = { deviceLabel, createdAt: new Date().toISOString(), expiresAt };
+  DB.auditLog = DB.auditLog || [];
+  DB.auditLog.unshift({ at: new Date().toISOString(), action: 'mobile-device-paired', actor: deviceLabel });
+  DB.auditLog = DB.auditLog.slice(0, 500);
+  saveDB();
+  res.json({ ok: true, token, expiresAt, deviceLabel });
+});
+
+app.get('/api/mobile/session', requireMobileSession, (req, res) => {
+  res.json({ ok: true, expiresAt: req.mobileSession.expiresAt, deviceLabel: req.mobileSession.deviceLabel });
+});
+
+app.post('/api/mobile/logout', requireMobileSession, (req, res) => {
+  delete DB.mobileSessions[req.mobileSession.tokenHash];
+  appendMobileAudit('mobile-device-unpaired', null, req);
+  saveDB();
+  res.json({ ok: true });
+});
+
+app.get('/api/mobile/licenses', requireMobileSession, (req, res) => {
+  const licenses = Object.values(DB.licenses || {})
+    .map(license => ({
+      ...license,
+      businessName: license.businessName || license.customerName || '',
+      customerName: license.customerName || license.businessName || '',
+      customerEmail: license.customerEmail || '',
+      status: licenseStatusOf(license),
+      activations: license.activations || []
+    }))
+    .sort((a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0));
+  res.json({ ok: true, licenses });
+});
+
+app.post('/api/mobile/licenses', requireMobileSession, (req, res) => {
+  const body = req.body || {};
+  const plan = String(body.plan || '').toLowerCase();
+  const businessName = String(body.businessName || '').trim();
+  const customerEmail = String(body.customerEmail || '').trim().toLowerCase();
+  const maxInstalls = Number(body.maxInstalls);
+  const expiryMonths = body.expiryMonths;
+  const paymentError = validateMobilePayment(body.payment);
+
+  if (!MOBILE_PLAN_CODES[plan]) return res.status(400).json({ ok: false, error: 'Choose a valid BMS plan.' });
+  if (!businessName || businessName.length > 160) return res.status(400).json({ ok: false, error: 'Business name is required and must be 160 characters or fewer.' });
+  if (customerEmail && (customerEmail.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customerEmail))) return res.status(400).json({ ok: false, error: 'Enter a valid customer email address.' });
+  if (!Number.isInteger(maxInstalls) || maxInstalls < 1 || maxInstalls > 10) return res.status(400).json({ ok: false, error: 'Maximum installs must be a whole number from 1 to 10.' });
+  if (plan !== 'lifetime' && expiryMonths !== null && expiryMonths !== undefined && (!Number.isInteger(expiryMonths) || expiryMonths < 1 || expiryMonths > 120)) return res.status(400).json({ ok: false, error: 'Expiry must be from 1 to 120 months, or blank.' });
+  if (body.notes != null && String(body.notes).length > 500) return res.status(400).json({ ok: false, error: 'License notes must be 500 characters or fewer.' });
+  if (paymentError) return res.status(400).json({ ok: false, error: paymentError });
+
+  const now = new Date();
+  let key = makeMobileLicenseKey(plan);
+  while (DB.licenses?.[key]) key = makeMobileLicenseKey(plan);
+  const expiresAt = plan === 'lifetime' || !expiryMonths
+    ? null
+    : new Date(now.getTime() + expiryMonths * 30 * 24 * 60 * 60 * 1000).toISOString();
+  const license = {
+    key,
+    businessName,
+    customerName: businessName,
+    customerEmail,
+    plan,
+    maxInstalls,
+    status: 'active',
+    expiresAt,
+    activations: [],
+    createdAt: now.toISOString(),
+    updatedAt: now.toISOString(),
+    notes: String(body.notes || '').trim()
+  };
+  DB.licenses = DB.licenses || {};
+  DB.licenses[key] = license;
+  const payment = addMobilePayment(license, body.payment, req);
+  license.paymentId = payment.id;
+  appendMobileAudit('mobile-license-create', key, req, { plan, businessName });
+  saveDB();
+  res.status(201).json({ ok: true, license, payment });
+});
+
+app.post('/api/mobile/licenses/:key/revoke', requireMobileSession, (req, res) => {
+  const parsed = parseLicenseKey(req.params.key);
+  const license = parsed && DB.licenses[parsed.key];
+  if (!license) return res.status(404).json({ ok: false, error: 'License not found.' });
+  license.status = 'revoked';
+  license.updatedAt = new Date().toISOString();
+  appendMobileAudit('mobile-license-revoke', parsed.key, req);
+  saveDB();
+  res.json({ ok: true, license: { ...license, status: licenseStatusOf(license) } });
+});
+
+app.post('/api/mobile/licenses/:key/reactivate', requireMobileSession, (req, res) => {
+  const parsed = parseLicenseKey(req.params.key);
+  const license = parsed && DB.licenses[parsed.key];
+  if (!license) return res.status(404).json({ ok: false, error: 'License not found.' });
+  license.status = 'active';
+  license.updatedAt = new Date().toISOString();
+  appendMobileAudit('mobile-license-reactivate', parsed.key, req);
+  saveDB();
+  res.json({ ok: true, license: { ...license, status: licenseStatusOf(license) } });
+});
+
+app.post('/api/mobile/licenses/:key/transfer', requireMobileSession, (req, res) => {
+  const parsed = parseLicenseKey(req.params.key);
+  const license = parsed && DB.licenses[parsed.key];
+  if (!license) return res.status(404).json({ ok: false, error: 'License not found.' });
+  license.activations = [];
+  license.updatedAt = new Date().toISOString();
+  appendMobileAudit('mobile-license-transfer', parsed.key, req);
+  saveDB();
+  res.json({ ok: true, license: { ...license, status: licenseStatusOf(license) } });
+});
+
+app.post('/api/mobile/licenses/:key/payments', requireMobileSession, (req, res) => {
+  const parsed = parseLicenseKey(req.params.key);
+  const license = parsed && DB.licenses[parsed.key];
+  if (!license) return res.status(404).json({ ok: false, error: 'License not found.' });
+  const body = req.body || {};
+  const paymentError = validateMobilePayment(body);
+  const extendMonths = body.extendMonths == null ? null : Number(body.extendMonths);
+  if (paymentError) return res.status(400).json({ ok: false, error: paymentError });
+  if (extendMonths !== null && (!Number.isInteger(extendMonths) || extendMonths < 1 || extendMonths > 120)) return res.status(400).json({ ok: false, error: 'Renewal term must be from 1 to 120 months.' });
+  if (extendMonths && license.plan === 'lifetime') return res.status(400).json({ ok: false, error: 'Lifetime licenses do not have an expiry date.' });
+
+  if (extendMonths) {
+    const currentExpiry = license.expiresAt && Date.parse(license.expiresAt) > Date.now()
+      ? Date.parse(license.expiresAt)
+      : Date.now();
+    license.expiresAt = new Date(currentExpiry + extendMonths * 30 * 24 * 60 * 60 * 1000).toISOString();
+    license.status = 'active';
+    license.updatedAt = new Date().toISOString();
+  }
+  const payment = addMobilePayment(license, body, req, extendMonths);
+  saveDB();
+  res.status(201).json({ ok: true, payment, license: { ...license, status: licenseStatusOf(license) } });
+});
+
+app.get('/api/mobile/payments', requireMobileSession, (req, res) => {
+  res.json({ ok: true, payments: (DB.mobilePayments || []).slice(0, 100) });
+});
+
+app.get('/api/mobile/audit-log', requireMobileSession, (req, res) => {
+  const auditLog = (DB.auditLog || [])
+    .filter(entry => /license|mobile|device-checkin/i.test(entry.action || ''))
+    .slice(0, 100);
+  res.json({ ok: true, auditLog });
+});
 
 // Public: activation / ongoing sign-in verification. Rate-limited by
 // the general publicLimiter above. No admin key needed — a license
